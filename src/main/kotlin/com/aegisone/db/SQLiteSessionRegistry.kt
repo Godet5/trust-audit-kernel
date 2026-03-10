@@ -142,6 +142,49 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
     }
 
     /**
+     * Mark all ACTIVE sessions whose expiry_ms <= [now] as EXPIRED, and return
+     * the session IDs that were transitioned.
+     *
+     * This is the sweep method used by ExpiryCoordinator. It differs from
+     * expireSessions() in that it returns the affected IDs rather than a count,
+     * allowing callers to invoke cleanup callbacks (e.g. MemorySteward.onSessionExpired)
+     * for each session that was just expired.
+     *
+     * SELECT and UPDATE use the same predicate within one transaction, so the
+     * returned IDs are exactly the rows that were updated.
+     */
+    @Synchronized
+    fun expireSessionsAndGetIds(now: Long = System.currentTimeMillis()): List<String> {
+        try {
+            conn.autoCommit = false
+            // Collect IDs matching the expiry predicate before the update
+            val ids = mutableListOf<String>()
+            conn.prepareStatement(
+                "SELECT session_id FROM sessions WHERE state = 'ACTIVE' AND expiry_ms <= ?"
+            ).use { ps ->
+                ps.setLong(1, now)
+                ps.executeQuery().use { rs ->
+                    while (rs.next()) ids.add(rs.getString("session_id"))
+                }
+            }
+            // Update the same predicate in the same transaction
+            if (ids.isNotEmpty()) {
+                conn.prepareStatement(
+                    "UPDATE sessions SET state = 'EXPIRED' WHERE state = 'ACTIVE' AND expiry_ms <= ?"
+                ).use { ps ->
+                    ps.setLong(1, now)
+                    ps.executeUpdate()
+                }
+            }
+            conn.commit()
+            return ids
+        } catch (e: Exception) {
+            runCatching { conn.rollback() }
+            throw IllegalStateException("expireSessionsAndGetIds failed", e)
+        }
+    }
+
+    /**
      * Explicitly close a session (e.g., user logout). State transitions to CLOSED.
      * Returns false if the session does not exist or is already EXPIRED/CLOSED.
      */
