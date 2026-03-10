@@ -1,0 +1,11 @@
+# Gradle build output
+build/
+.gradle/
+
+# Native library — extracted at setup time, not committed
+# Run scripts/extract-sqlite-native.sh after clone on Termux/Android
+native/libsqlitejdbc.so
+
+# IDE
+.idea/
+*.iml
