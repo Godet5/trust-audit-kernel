@@ -73,6 +73,23 @@ object ReviewDbBootstrap {
                 )
                 """.trimIndent()
             )
+
+            // Sessions. Managed by SQLiteSessionRegistry.
+            // state: ACTIVE | EXPIRED | CLOSED
+            // active field on SessionEntry is derived: state == 'ACTIVE'
+            // expireSessions() marks ACTIVE rows EXPIRED when expiry_ms <= now.
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id          TEXT    PRIMARY KEY,
+                    cert_fingerprint    TEXT    NOT NULL,
+                    state               TEXT    NOT NULL,
+                    created_at_ms       INTEGER NOT NULL,
+                    last_heartbeat_ms   INTEGER NOT NULL,
+                    expiry_ms           INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
         }
     }
 }
