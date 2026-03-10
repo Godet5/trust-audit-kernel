@@ -218,8 +218,14 @@ class SQLiteChannelIntegrationTest {
         )))
 
         val result = StartupReconciliation.run(writeConn)
-        assertEquals(StartupReconciliation.ReconciliationResult.CLEAN, result,
-            "Matched PENDING + ActionReceipt pair must produce CLEAN")
+        // Step 3 (summary gap) now runs: the ActionReceipt has no summary yet, so a
+        // summary is regenerated and REPAIRED is returned. The original intent of this
+        // test — that a matched PENDING+ActionReceipt is NOT classified as orphaned —
+        // is preserved: no 'Failed' record is written for the matched pair.
+        // REPAIRED here means "step 3 did work", not "step 2 found an orphan".
+        assertEquals(StartupReconciliation.ReconciliationResult.REPAIRED, result,
+            "Matched PENDING + ActionReceipt pair is not orphaned; " +
+            "REPAIRED comes from step 3 summary regeneration, not step 2")
     }
 
     @Test

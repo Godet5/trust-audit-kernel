@@ -80,6 +80,28 @@ object SQLiteBootstrap {
                 )
                 """.trimIndent()
             )
+
+            // Receipt summary store — RECEIPT_SUMMARY_CHANNEL target.
+            // Summaries are derived from full ActionReceipts and are regenerable
+            // (W3 crash window). Zone B storage in production (best-effort, not
+            // correctness-critical). Kept in the same DB for Phase 0 simplicity.
+            // 'regenerated' flag distinguishes startup-regenerated rows from
+            // rows written inline during normal coordinator operation.
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS receipt_summaries (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    receipt_id              TEXT    NOT NULL UNIQUE,
+                    agent_id                TEXT    NOT NULL,
+                    session_id              TEXT    NOT NULL,
+                    status                  TEXT    NOT NULL,
+                    capability_name         TEXT    NOT NULL,
+                    receipt_timestamp_ms    INTEGER NOT NULL,
+                    inserted_at_ms          INTEGER NOT NULL,
+                    regenerated             INTEGER NOT NULL DEFAULT 0
+                )
+                """.trimIndent()
+            )
         }
     }
 }
