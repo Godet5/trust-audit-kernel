@@ -83,6 +83,15 @@ class TrustInit(
                 sequenceNumber = seq,
                 issuer = identity
             )
+        } catch (e: Exception) {
+            // Any unexpected exception from Zone A reads (e.g. corrupted version_floor,
+            // unreadable platform key file) is a verification failure, not a propagated crash.
+            // The system must fail closed. The caller receives a BootFailed, not a thrown exception.
+            return BootSignal.Failed(
+                step = VerificationStep.ZONE_A_ACCESS,
+                reason = "Unexpected error during manifest verification: ${e.javaClass.simpleName}: ${e.message}",
+                issuer = identity
+            )
         } finally {
             access.release()
         }
