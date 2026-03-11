@@ -81,6 +81,46 @@ object SQLiteBootstrap {
                 """.trimIndent()
             )
 
+            // Authority decision store — every grant attempt, issued or denied.
+            // Separate from receipts; authority decisions and execution receipts are
+            // distinct audit streams. One row per grant attempt.
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS authority_decisions (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    decision_type    TEXT    NOT NULL,
+                    timestamp_ms     INTEGER NOT NULL,
+                    capability_name  TEXT    NOT NULL,
+                    target_role      TEXT    NOT NULL,
+                    authority        TEXT    NOT NULL,
+                    manifest_version INTEGER,
+                    floor_version    INTEGER,
+                    reason           TEXT,
+                    inserted_at_ms   INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+
+            // System lifecycle event store — structured operational events from
+            // orchestration components: boot outcomes, recovery results.
+            // One row per lifecycle transition.
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS system_events (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type            TEXT    NOT NULL,
+                    timestamp_ms          INTEGER NOT NULL,
+                    manifest_version      INTEGER,
+                    step                  TEXT,
+                    reason                TEXT,
+                    reconciliation_status TEXT,
+                    expired_sessions      INTEGER,
+                    ready_for_active      INTEGER,
+                    inserted_at_ms        INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+
             // Receipt summary store — RECEIPT_SUMMARY_CHANNEL target.
             // Summaries are derived from full ActionReceipts and are regenerable
             // (W3 crash window). Zone B storage in production (best-effort, not

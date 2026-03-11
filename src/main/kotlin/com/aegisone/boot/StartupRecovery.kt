@@ -48,7 +48,8 @@ class StartupRecovery(
     private val artifactStore: ArtifactStore,
     private val lockManager: ArtifactLockManager,
     private val receiptChannel: ReceiptChannel,
-    private val conflictChannel: ConflictChannel? = null
+    private val conflictChannel: ConflictChannel? = null,
+    private val systemEventChannel: SystemEventChannel? = null
 ) {
     fun run(now: Long = System.currentTimeMillis()): StartupRecoveryResult {
         // Phase 1: reconcile receipt/audit state
@@ -65,7 +66,13 @@ class StartupRecovery(
         )
         val expiredSessions = ExpiryCoordinator(sessionRegistry, expiryMemorySteward).sweep(now)
 
-        return StartupRecoveryResult(reconciliation, expiredSessions)
+        val result = StartupRecoveryResult(reconciliation, expiredSessions)
+        systemEventChannel?.emit(SystemEvent.RecoveryCompleted(
+            reconciliationStatus = reconciliation.name,
+            expiredSessions      = expiredSessions,
+            readyForActive       = result.readyForActive
+        ))
+        return result
     }
 
     private object NoOpTokenVerifier : TokenVerifier {

@@ -1,5 +1,6 @@
 package com.aegisone.boot
 
+import com.aegisone.broker.AuthorityDecisionChannel
 import com.aegisone.broker.CapabilityBroker
 import com.aegisone.receipt.ReceiptChannel
 import com.aegisone.trust.BootSignal
@@ -27,7 +28,9 @@ import com.aegisone.trust.ZoneAStore
 class BootOrchestrator(
     private val zoneAStore: ZoneAStore,
     private val versionFloorProvider: VersionFloorProvider,
-    private val receiptChannel: ReceiptChannel
+    private val receiptChannel: ReceiptChannel,
+    private val systemEventChannel: SystemEventChannel? = null,
+    private val authorityDecisionChannel: AuthorityDecisionChannel? = null
 ) {
     fun boot(): BootResult {
         val trustInit = TrustInit(zoneAStore)
@@ -36,20 +39,24 @@ class BootOrchestrator(
         val broker = CapabilityBroker(
             receiptChannel = receiptChannel,
             trustedIssuer = trustInit.identity,
-            versionFloorProvider = versionFloorProvider
+            versionFloorProvider = versionFloorProvider,
+            authorityDecisionChannel = authorityDecisionChannel
         )
 
         val accepted = broker.initialize(signal)
 
         return if (accepted) {
+            val verified = signal as BootSignal.Verified
+            systemEventChannel?.emit(SystemEvent.BootVerified(manifestVersion = verified.manifestVersion))
             BootResult.Active(broker)
         } else {
-            val reason = when (signal) {
+            val (step, reason) = when (signal) {
                 is BootSignal.Failed ->
-                    "Verification failed at ${signal.step}: ${signal.reason}"
+                    Pair(signal.step.name, "Verification failed at ${signal.step}: ${signal.reason}")
                 is BootSignal.Verified ->
-                    "Broker rejected verified signal (origin/sequence/version check failed)"
+                    Pair("BROKER_INIT", "Broker rejected verified signal (origin/sequence/version check failed)")
             }
+            systemEventChannel?.emit(SystemEvent.BootFailed(step = step, reason = reason))
             BootResult.Failed(reason)
         }
     }
