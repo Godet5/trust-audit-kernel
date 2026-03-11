@@ -5,6 +5,7 @@ import com.aegisone.receipt.Receipt
 import com.aegisone.receipt.ReceiptChannel
 import java.util.UUID
 
+
 /**
  * Owns the action lifecycle from capability validation through result delivery.
  * No module may execute a governed action by calling an executor directly —
@@ -12,6 +13,10 @@ import java.util.UUID
  *
  * The coordinator enforces I-3 structurally.
  * Currently implemented:
+ *   step_0: live registry check (closes G-5) — if agentRegistry is wired, the
+ *           requesting agent must be currently registered; deregistered agents
+ *           are denied with AGENT_NOT_REGISTERED and a PolicyViolation receipt.
+ *           No PENDING is written for a denied agent.
  *   step_1: PENDING record durably written to AUDIT_FAILURE_CHANNEL before execution
  *   step_2: executor called only after step_1 acknowledged
  *   step_3: full ActionReceipt written to RECEIPT_CHANNEL after execution;
@@ -20,7 +25,11 @@ import java.util.UUID
  * Pending:
  *   step_4: summary written (best-effort) — I3-T5
  *
- * Traces to: I-3
+ * [agentRegistry] is optional. When null, the registry check is skipped and
+ * existing behavior is preserved. This maintains backward compatibility for
+ * all callers that do not wire a registry.
+ *
+ * Traces to: I-3, G-5 (authority-continuity closure)
  * Source: implementationMap-trust-and-audit-v1.md §3
  */
 class ExecutionCoordinator(
@@ -30,11 +39,26 @@ class ExecutionCoordinator(
     private val reversibilityRegistry: ReversibilityRegistry = IrreversibleByDefault,
     private val conflictChannel: ConflictChannel = SilentConflictChannel,
     private val resultSink: ResultSink = NoOpResultSink,
-    private val sequenceProvider: SequenceProvider = MonotonicSequenceProvider()
+    private val sequenceProvider: SequenceProvider = MonotonicSequenceProvider(),
+    private val agentRegistry: AgentRegistry? = null
 ) {
     private var lastAcceptedSequence = 0
 
     fun execute(request: ActionRequest): CoordinatorResult {
+        // Step 0: Live registry check (G-5 closure).
+        // If a registry is wired, the requesting agent must be currently registered.
+        // This is checked before PENDING is written — a denied agent produces no
+        // PENDING record and the executor is never called.
+        if (agentRegistry != null && agentRegistry.slotOf(request.agentId) == null) {
+            receiptChannel.write(Receipt.PolicyViolation(
+                violation = "AGENT_NOT_REGISTERED",
+                detail    = "Agent '${request.agentId}' attempted to execute " +
+                            "'${request.capabilityName}' but is not currently registered; " +
+                            "authority revoked at deregistration time"
+            ))
+            return CoordinatorResult.AGENT_NOT_REGISTERED
+        }
+
         val receiptId = UUID.randomUUID().toString()
         val seq = sequenceProvider.next()
 

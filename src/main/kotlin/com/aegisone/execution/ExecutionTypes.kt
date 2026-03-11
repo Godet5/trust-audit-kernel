@@ -30,7 +30,18 @@ enum class CoordinatorResult {
      *
      * Source: implementationMap-trust-and-audit-v1.md §3.2 step_3
      */
-    UNAUDITED_IRREVERSIBLE
+    UNAUDITED_IRREVERSIBLE,
+    /**
+     * Action blocked because the requesting agent is not currently registered
+     * in the AgentRegistry. The executor is never called.
+     *
+     * This closes G-5: authority revocation is complete — a deregistered agent
+     * cannot execute with a stale capability, because the coordinator checks live
+     * registry state before writing PENDING.
+     *
+     * A PolicyViolation receipt is written to RECEIPT_CHANNEL identifying the denial.
+     */
+    AGENT_NOT_REGISTERED
 }
 
 /**

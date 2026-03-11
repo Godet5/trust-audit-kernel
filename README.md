@@ -94,6 +94,7 @@ invocations, not test methods — repeated tests (×N) are counted separately.
 | `CrossTableReviewCorruptionE2ETest` | Review state survives cross-table crash | UNDER_REVIEW with no lock, ghost lock (absent session), EXPIRED session with lock, all three simultaneously, clean state (no spurious repair) | 5 |
 | `KillWindowRealismE2ETest` | Crash windows W1/W3 and review violations survive kill | Real writes committed, connection closed, fresh connection, reconciliation repairs | 5 |
 | `ConcurrencyEnvelopeE2ETest` | D-NC3 ceiling holds under thread contention | Two concurrent HELPER spawns (×10), full ceiling third spawn (×10), concurrent deregister+spawn (×10), duplicate agent_id race (×10), recursive spawn, recursive spawn with open slot, denial observability, 20-thread stress race (×5) | 49 |
+| `StaleCapabilityRevocationTest` | G-5: deregistered agent cannot execute stale capability | Deregister then execute, never-registered agent, live check (succeed then block), denial observable as PolicyViolation, no-registry backward compat | 5 |
 | `ObservabilityE2ETest` | Every decision is observable | Boot+grant decisions durable, boot failure recorded, recovery telemetry | 3 |
 | `ManifestEvolutionE2ETest` | Authority evolves correctly across floor raise | Floor blocks old manifest, v2 resolves, upgrade trail | 2 |
 | `DirtyRestartE2ETest` | Recovery gates ACTIVE correctly | Multi-scenario dirty restart, UNRESOLVED_FAILURES blocks ACTIVE | 2 |
@@ -103,7 +104,7 @@ invocations, not test methods — repeated tests (×N) are counted separately.
 | `ReviewSliceE2ETest` | Review slice end-to-end | Full write path, grant denied for unknown capability | 2 |
 | SQLite + ZoneA integration tests | Backend round-trips | Channel writes, reconciliation steps, session registry, artifact store, lock manager, version floor | 57 |
 
-**Total: 182 / 182**
+**Total: 187 / 187**
 
 ---
 
@@ -208,13 +209,13 @@ been made. A channel write failure does not affect the decision outcome. An
 attacker who can suppress the channel write can make decisions invisible to the
 operator without affecting actual enforcement.
 
-**G-5: AgentRegistry tracks registration, not capability use.**
-An `IssuedCapability` is issued by the broker independently of the registry.
-The registry enforces the ceiling at spawn time; it does not revoke capabilities
-when an agent is deregistered. A deregistered agent that retains an
-`IssuedCapability` object can still submit `ActionRequest`s to an
-`ExecutionCoordinator`. Enforcement of "deregistered = no further execution"
-requires coupling the coordinator to the registry, which is not yet done.
+**G-5: ~~AgentRegistry tracks registration, not capability use.~~ CLOSED.**
+The coordinator now takes an optional `agentRegistry` parameter (null = legacy
+behavior, backward-compatible). When wired, the coordinator checks live registry
+state at step_0 — before writing PENDING, before calling the executor. A
+deregistered or never-registered agent receives `AGENT_NOT_REGISTERED` and a
+durable `PolicyViolation` receipt. The executor is never called. Proven by
+`StaleCapabilityRevocationTest` SC-1..SC-5.
 
 **G-6: Sequence gap alerting is advisory.**
 `StartupReconciliation` step 4 detects sequence gaps and emits `ConflictAlert`s
