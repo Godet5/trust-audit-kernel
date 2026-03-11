@@ -14,7 +14,7 @@ fault injection, restart, and concurrent spawn pressure.
 
 ```bash
 git clone <repo-url>
-cd harness
+cd trust-audit-kernel
 
 # Standard JVM (Linux x86_64, macOS, Windows) — no extra steps
 ./gradlew test
@@ -28,8 +28,8 @@ bash scripts/extract-sqlite-native.sh
 ```
 
 The build detects Termux automatically and routes sqlite-jdbc to the pre-extracted native
-library in `harness/native/`. On standard JVMs, sqlite-jdbc uses its own bundled native.
-If `harness/native/libsqlitejdbc.so` is absent on Termux, run the extraction script first.
+library in `native/`. On standard JVMs, sqlite-jdbc uses its own bundled native.
+If `native/libsqlitejdbc.so` is absent on Termux, run the extraction script first.
 
 ---
 
@@ -149,7 +149,7 @@ broker/
 execution/
   ExecutionCoordinator.kt      I-3 enforcer: PENDING → execute → receipt ack → deliver
   ExecutionTypes.kt            ActionRequest, AuditRecord, CoordinatorResult, channel interfaces
-  ReversibilityRegistry.kt     Reversibility classification; IrreversibleByDefault is safe default
+  ExecutionOutcomeRegistry.kt  Compensation registry; NoCompensationRegistry is safe default (fail toward UNAUDITED_IRREVERSIBLE)
   AgentRegistry.kt             Interface: register / deregister / activeCount / slotOf
   AgentRegistryTypes.kt        AgentSlot, RegistrationResult, DenialReason, ActiveAgentRow
 
@@ -307,7 +307,7 @@ For recovery, use `StartupRecovery.run()`.
 | `reviewSystemSpec-v1.md` | Review interface; 7-step validation; session auth; field authority |
 | `threatModel-v1.1.md` | Threat model baseline |
 
-All documents are in `~/agenticPhone/draftPlans/`.
+All documents are in the sibling `draftPlans/` directory of this repo's parent (not published here; the harness is self-contained as a test artifact).
 
 If a test and the spec disagree:
 1. Check whether the spec changed.
