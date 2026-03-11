@@ -6,13 +6,13 @@ import com.aegisone.db.SQLiteBootstrap
 import com.aegisone.execution.AgentSlot
 import com.aegisone.execution.DenialReason
 import com.aegisone.execution.RegistrationResult
+import com.aegisone.db.SharedConnection
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.RepeatedTest
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -59,20 +59,20 @@ class ConcurrencyEnvelopeE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
     private lateinit var registry: SQLiteAgentRegistry
     private lateinit var decisionChannel: SQLiteAuthorityDecisionChannel
 
     @BeforeEach
     fun setup() {
-        conn            = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        decisionChannel = SQLiteAuthorityDecisionChannel(conn)
-        registry        = SQLiteAgentRegistry(conn, decisionChannel)
+        shared          = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        decisionChannel = SQLiteAuthorityDecisionChannel(shared)
+        registry        = SQLiteAgentRegistry(shared, decisionChannel)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     // -------------------------------------------------------------------------
@@ -284,7 +284,7 @@ class ConcurrencyEnvelopeE2ETest {
         registry.register("recursive-ce6", AgentSlot.HELPER, requestingAgentId = "helper-ce6")
 
         // All four denials must appear in authority_decisions
-        val deniedCount = conn.createStatement().use { stmt ->
+        val deniedCount = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM authority_decisions WHERE decision_type = 'SpawnDenied'"
             ).use { rs -> if (rs.next()) rs.getInt(1) else 0 }
@@ -293,7 +293,7 @@ class ConcurrencyEnvelopeE2ETest {
             "All 4 denied spawn attempts must produce SpawnDenied records")
 
         // The recursive denial must carry its specific reason
-        val recursiveDenial = conn.createStatement().use { stmt ->
+        val recursiveDenial = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT reason FROM authority_decisions " +
                 "WHERE decision_type = 'SpawnDenied' AND reason = 'RECURSIVE_SPAWN_DENIED'"
@@ -303,7 +303,7 @@ class ConcurrencyEnvelopeE2ETest {
         assertEquals("RECURSIVE_SPAWN_DENIED", recursiveDenial)
 
         // The successful spawns must also appear as SpawnIssued
-        val issuedCount = conn.createStatement().use { stmt ->
+        val issuedCount = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM authority_decisions WHERE decision_type = 'SpawnIssued'"
             ).use { rs -> if (rs.next()) rs.getInt(1) else 0 }

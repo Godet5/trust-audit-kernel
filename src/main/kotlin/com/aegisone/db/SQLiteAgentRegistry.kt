@@ -7,7 +7,6 @@ import com.aegisone.execution.AgentRegistry
 import com.aegisone.execution.AgentSlot
 import com.aegisone.execution.DenialReason
 import com.aegisone.execution.RegistrationResult
-import java.sql.Connection
 
 /**
  * SQLite-backed AgentRegistry.
@@ -15,13 +14,20 @@ import java.sql.Connection
  * Enforces the Phase 0 ceiling (D-NC3): max 2 agents globally, max 1 per slot
  * (PRIMARY, HELPER), no recursive spawn from HELPER agents.
  *
- * Atomicity guarantee:
- *   All reads (count, slot check, requester slot) and the INSERT are performed
- *   inside a single @Synchronized block on the registry instance. Concurrent
- *   register() calls are serialized — the ceiling check and the slot insertion
- *   are never observed by two threads simultaneously. The DB PRIMARY KEY on
- *   agent_id is a DB-level safety net that rejects any duplicate that somehow
- *   bypasses the synchronized block.
+ * Atomicity guarantee (dual-layer):
+ *   Layer 1 (JVM): synchronized(shared) serializes threads within one process.
+ *   Layer 2 (SQLite): BEGIN IMMEDIATE serializes across processes. The entire
+ *   check-and-insert sequence (recursive spawn check, duplicate check, global
+ *   ceiling, per-slot ceiling, INSERT) executes inside a single IMMEDIATE
+ *   transaction. BEGIN IMMEDIATE acquires SQLite's reserved lock before any
+ *   reads, preventing concurrent connections from interleaving their own
+ *   check-and-insert between this connection's count read and insert.
+ *
+ * The DB PRIMARY KEY on agent_id is a third-layer safety net that rejects
+ * any duplicate that somehow bypasses both locks.
+ *
+ * Thread safety: synchronized on [shared] (intra-process) + BEGIN IMMEDIATE
+ * (inter-process). Closes ACN-1 and G-1.
  *
  * Observability:
  *   Every registration attempt (success or denial) is recorded to
@@ -33,7 +39,7 @@ import java.sql.Connection
  * Source: agentPolicyEngine-v2.1 §D-NC3, §DR-01
  */
 class SQLiteAgentRegistry(
-    private val conn: Connection,
+    private val shared: SharedConnection,
     private val decisionChannel: AuthorityDecisionChannel? = null
 ) : AgentRegistry {
 
@@ -42,29 +48,39 @@ class SQLiteAgentRegistry(
         private const val SLOT_CEILING   = 1
     }
 
-    @Synchronized
     override fun register(
         agentId: String,
         slot: AgentSlot,
         requestingAgentId: String?
-    ): RegistrationResult {
+    ): RegistrationResult = synchronized(shared) {
+        // BEGIN IMMEDIATE acquires SQLite's reserved lock before any reads.
+        // This serializes the entire check-and-insert across connections (processes).
+        shared.conn.autoCommit = true
+        shared.conn.createStatement().use { it.execute("BEGIN IMMEDIATE") }
 
-        // Step 1: Recursive spawn check.
-        // If the requesting agent is itself a HELPER, deny before ceiling check.
-        if (requestingAgentId != null && slotOf(requestingAgentId) == AgentSlot.HELPER) {
-            val denial = RegistrationResult.Denied(DenialReason.RECURSIVE_SPAWN_DENIED)
-            decisionChannel?.record(AuthorityDecision.SpawnDenied(
-                agentId          = agentId,
-                slot             = slot,
-                requestingAgentId = requestingAgentId,
-                reason           = DenialReason.RECURSIVE_SPAWN_DENIED.name
-            ))
-            return denial
-        }
-
-        // Step 2: Duplicate agent_id check.
-        if (slotOf(agentId) != null) {
+        val result: RegistrationResult
+        try {
+            val denial = doRegisterChecks(agentId, slot, requestingAgentId)
+            if (denial != null) {
+                shared.conn.createStatement().use { it.execute("ROLLBACK") }
+                result = denial
+            } else {
+                // All checks passed — insert within the same IMMEDIATE transaction.
+                shared.conn.prepareStatement(
+                    "INSERT INTO active_agents (agent_id, slot, registered_at_ms) VALUES (?, ?, ?)"
+                ).use { ps ->
+                    ps.setString(1, agentId)
+                    ps.setString(2, slot.name)
+                    ps.setLong(3, System.currentTimeMillis())
+                    ps.executeUpdate()
+                }
+                shared.conn.createStatement().use { it.execute("COMMIT") }
+                result = RegistrationResult.Registered
+            }
+        } catch (e: Exception) {
+            runCatching { shared.conn.createStatement().use { it.execute("ROLLBACK") } }
             val denial = RegistrationResult.Denied(DenialReason.DUPLICATE_AGENT_ID)
+            // Decision recording is outside the transaction (best-effort).
             decisionChannel?.record(AuthorityDecision.SpawnDenied(
                 agentId          = agentId,
                 slot             = slot,
@@ -72,92 +88,95 @@ class SQLiteAgentRegistry(
                 reason           = DenialReason.DUPLICATE_AGENT_ID.name
             ))
             return denial
+        }
+
+        // Decision recording happens AFTER the transaction closes.
+        // decisionChannel?.record() starts its own transaction — cannot nest
+        // inside the IMMEDIATE transaction above.
+        when (result) {
+            is RegistrationResult.Registered -> {
+                decisionChannel?.record(AuthorityDecision.SpawnIssued(
+                    agentId          = agentId,
+                    slot             = slot,
+                    requestingAgentId = requestingAgentId
+                ))
+            }
+            is RegistrationResult.Denied -> {
+                decisionChannel?.record(AuthorityDecision.SpawnDenied(
+                    agentId          = agentId,
+                    slot             = slot,
+                    requestingAgentId = requestingAgentId,
+                    reason           = result.reason.name
+                ))
+            }
+        }
+        return result
+    }
+
+    /**
+     * Runs steps 1–4 of the registration checks. MUST be called inside an
+     * active BEGIN IMMEDIATE transaction — all reads see a serialized snapshot.
+     *
+     * Returns null if all checks pass (caller should proceed to INSERT).
+     * Returns a Denied result if any check fails (caller should ROLLBACK).
+     *
+     * Does NOT record decisions — caller records after the transaction closes,
+     * since the decision channel starts its own transaction.
+     */
+    private fun doRegisterChecks(
+        agentId: String,
+        slot: AgentSlot,
+        requestingAgentId: String?
+    ): RegistrationResult.Denied? {
+        // Step 1: Recursive spawn check.
+        if (requestingAgentId != null && slotOfInternal(requestingAgentId) == AgentSlot.HELPER) {
+            return RegistrationResult.Denied(DenialReason.RECURSIVE_SPAWN_DENIED)
+        }
+
+        // Step 2: Duplicate agent_id check.
+        if (slotOfInternal(agentId) != null) {
+            return RegistrationResult.Denied(DenialReason.DUPLICATE_AGENT_ID)
         }
 
         // Step 3: Global ceiling check (max 2 total).
         val totalActive = queryCount("SELECT COUNT(*) FROM active_agents")
         if (totalActive >= GLOBAL_CEILING) {
-            val denial = RegistrationResult.Denied(DenialReason.CEILING_REACHED)
-            decisionChannel?.record(AuthorityDecision.SpawnDenied(
-                agentId          = agentId,
-                slot             = slot,
-                requestingAgentId = requestingAgentId,
-                reason           = DenialReason.CEILING_REACHED.name
-            ))
-            return denial
+            return RegistrationResult.Denied(DenialReason.CEILING_REACHED)
         }
 
         // Step 4: Per-slot ceiling check (max 1 per slot).
-        val slotActive = queryCount("SELECT COUNT(*) FROM active_agents WHERE slot = '${slot.name}'")
+        val slotActive = queryCountParam(
+            "SELECT COUNT(*) FROM active_agents WHERE slot = ?", slot.name
+        )
         if (slotActive >= SLOT_CEILING) {
-            val denial = RegistrationResult.Denied(DenialReason.SLOT_OCCUPIED)
-            decisionChannel?.record(AuthorityDecision.SpawnDenied(
-                agentId          = agentId,
-                slot             = slot,
-                requestingAgentId = requestingAgentId,
-                reason           = DenialReason.SLOT_OCCUPIED.name
-            ))
-            return denial
+            return RegistrationResult.Denied(DenialReason.SLOT_OCCUPIED)
         }
 
-        // Step 5: All checks passed — insert.
-        try {
-            conn.autoCommit = false
-            conn.prepareStatement(
-                "INSERT INTO active_agents (agent_id, slot, registered_at_ms) VALUES (?, ?, ?)"
-            ).use { ps ->
-                ps.setString(1, agentId)
-                ps.setString(2, slot.name)
-                ps.setLong(3, System.currentTimeMillis())
-                ps.executeUpdate()
-            }
-            conn.commit()
-        } catch (e: Exception) {
-            runCatching { conn.rollback() }
-            // The DB PRIMARY KEY constraint is the last line of defence.
-            // A duplicate key exception here means DUPLICATE_AGENT_ID.
-            // Any other exception is also treated as DUPLICATE_AGENT_ID
-            // to preserve fail-closed semantics.
-            val denial = RegistrationResult.Denied(DenialReason.DUPLICATE_AGENT_ID)
-            decisionChannel?.record(AuthorityDecision.SpawnDenied(
-                agentId          = agentId,
-                slot             = slot,
-                requestingAgentId = requestingAgentId,
-                reason           = DenialReason.DUPLICATE_AGENT_ID.name
-            ))
-            return denial
-        }
-
-        decisionChannel?.record(AuthorityDecision.SpawnIssued(
-            agentId          = agentId,
-            slot             = slot,
-            requestingAgentId = requestingAgentId
-        ))
-        return RegistrationResult.Registered
+        return null  // all checks passed
     }
 
-    @Synchronized
-    override fun deregister(agentId: String) {
+    override fun deregister(agentId: String): Unit = synchronized(shared) {
         try {
-            conn.autoCommit = false
-            conn.prepareStatement("DELETE FROM active_agents WHERE agent_id = ?").use { ps ->
+            shared.conn.autoCommit = true
+            shared.conn.createStatement().use { it.execute("BEGIN IMMEDIATE") }
+            shared.conn.prepareStatement("DELETE FROM active_agents WHERE agent_id = ?").use { ps ->
                 ps.setString(1, agentId)
                 ps.executeUpdate()
             }
-            conn.commit()
+            shared.conn.createStatement().use { it.execute("COMMIT") }
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.createStatement().use { it.execute("ROLLBACK") } }
             // Deregister is best-effort; failure is not propagated.
         }
     }
 
-    @Synchronized
-    override fun activeCount(): Int = queryCount("SELECT COUNT(*) FROM active_agents")
+    override fun activeCount(): Int = synchronized(shared) {
+        queryCount("SELECT COUNT(*) FROM active_agents")
+    }
 
-    @Synchronized
-    override fun activeAgents(): List<ActiveAgentRow> {
+    override fun activeAgents(): List<ActiveAgentRow> = synchronized(shared) {
         val rows = mutableListOf<ActiveAgentRow>()
-        conn.createStatement().use { stmt ->
+        shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT agent_id, slot, registered_at_ms FROM active_agents ORDER BY registered_at_ms ASC"
             ).use { rs ->
@@ -170,12 +189,25 @@ class SQLiteAgentRegistry(
                 }
             }
         }
-        return rows
+        rows
     }
 
-    @Synchronized
-    override fun slotOf(agentId: String): AgentSlot? {
-        return conn.prepareStatement(
+    override fun slotOf(agentId: String): AgentSlot? = synchronized(shared) {
+        slotOfInternal(agentId)
+    }
+
+    override fun <T> checkAndBegin(agentId: String, block: () -> T): T? = synchronized(shared) {
+        // slotOfInternal runs inside synchronized(shared) — same lock as register()/deregister().
+        // The block runs while this lock is still held, so no concurrent deregister()
+        // can interleave between the registration check and whatever the block does
+        // (e.g., writing a PENDING record).
+        if (slotOfInternal(agentId) == null) return null
+        block()
+    }
+
+    // Internal — must only be called from within a synchronized(shared) block.
+    private fun slotOfInternal(agentId: String): AgentSlot? {
+        return shared.conn.prepareStatement(
             "SELECT slot FROM active_agents WHERE agent_id = ?"
         ).use { ps ->
             ps.setString(1, agentId)
@@ -185,10 +217,19 @@ class SQLiteAgentRegistry(
         }
     }
 
-    // Not synchronized — must only be called from within a synchronized block.
+    // Internal — must only be called from within a synchronized(shared) block.
     private fun queryCount(sql: String): Int =
-        conn.createStatement().use { stmt ->
+        shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(sql).use { rs ->
+                if (rs.next()) rs.getInt(1) else 0
+            }
+        }
+
+    // Parameterized count query — used for slot ceiling check (AOE-1 fix).
+    private fun queryCountParam(sql: String, param: String): Int =
+        shared.conn.prepareStatement(sql).use { ps ->
+            ps.setString(1, param)
+            ps.executeQuery().use { rs ->
                 if (rs.next()) rs.getInt(1) else 0
             }
         }

@@ -30,7 +30,7 @@ class BootOrchestrator(
     private val versionFloorProvider: VersionFloorProvider,
     private val receiptChannel: ReceiptChannel,
     private val systemEventChannel: SystemEventChannel? = null,
-    private val authorityDecisionChannel: AuthorityDecisionChannel? = null
+    private val authorityDecisionChannel: AuthorityDecisionChannel
 ) {
     fun boot(): BootResult {
         val trustInit = TrustInit(zoneAStore)
@@ -40,7 +40,8 @@ class BootOrchestrator(
             receiptChannel = receiptChannel,
             trustedIssuer = trustInit.identity,
             versionFloorProvider = versionFloorProvider,
-            authorityDecisionChannel = authorityDecisionChannel
+            authorityDecisionChannel = authorityDecisionChannel,
+            systemEventChannel = systemEventChannel
         )
 
         val accepted = broker.initialize(signal)

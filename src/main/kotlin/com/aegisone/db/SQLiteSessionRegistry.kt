@@ -2,7 +2,6 @@ package com.aegisone.db
 
 import com.aegisone.review.SessionEntry
 import com.aegisone.review.SessionRegistry
-import java.sql.Connection
 
 /**
  * SQLite-backed SessionRegistry.
@@ -24,18 +23,17 @@ import java.sql.Connection
  * Write methods throw IllegalStateException on SQL failure.
  * [lookup] returns null on missing or read failure (safe default).
  *
- * Thread safety: @Synchronized on all methods.
+ * Thread safety: synchronized on [shared].
  *
  * Source: implementationMap-trust-and-audit-v1.md §4.2, §4.3 step_2
  */
-class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
+class SQLiteSessionRegistry(private val shared: SharedConnection) : SessionRegistry {
 
     // --- SessionRegistry interface ---
 
-    @Synchronized
-    override fun lookup(sessionId: String): SessionEntry? {
-        return runCatching {
-            conn.prepareStatement(
+    override fun lookup(sessionId: String): SessionEntry? = synchronized(shared) {
+        runCatching {
+            shared.conn.prepareStatement(
                 """
                 SELECT session_id, cert_fingerprint, state, expiry_ms
                 FROM sessions WHERE session_id = ?
@@ -62,12 +60,11 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * Returns false if a session with this ID already exists or on write failure.
      * Throws IllegalStateException on SQL failure after a successful row check.
      */
-    @Synchronized
-    fun openSession(sessionId: String, certFingerprint: String, expiryMs: Long): Boolean {
+    fun openSession(sessionId: String, certFingerprint: String, expiryMs: Long): Boolean = synchronized(shared) {
         val now = System.currentTimeMillis()
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 """
                 INSERT OR IGNORE INTO sessions
                     (session_id, cert_fingerprint, state, created_at_ms, last_heartbeat_ms, expiry_ms)
@@ -80,11 +77,11 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
                 ps.setLong(4, now)
                 ps.setLong(5, expiryMs)
                 val rows = ps.executeUpdate()
-                conn.commit()
+                shared.conn.commit()
                 return rows > 0
             }
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("openSession failed for $sessionId", e)
         }
     }
@@ -93,12 +90,11 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * Extend the expiry of an ACTIVE session to [newExpiryMs].
      * No-op (returns false) if the session is not ACTIVE or does not exist.
      */
-    @Synchronized
-    fun heartbeat(sessionId: String, newExpiryMs: Long): Boolean {
+    fun heartbeat(sessionId: String, newExpiryMs: Long): Boolean = synchronized(shared) {
         val now = System.currentTimeMillis()
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 """
                 UPDATE sessions
                 SET expiry_ms = ?, last_heartbeat_ms = ?
@@ -109,11 +105,11 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
                 ps.setLong(2, now)
                 ps.setString(3, sessionId)
                 val rows = ps.executeUpdate()
-                conn.commit()
+                shared.conn.commit()
                 return rows > 0
             }
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("heartbeat failed for $sessionId", e)
         }
     }
@@ -123,20 +119,19 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * Returns the count of sessions transitioned.
      * Called by the coordinator or a scheduled sweep before processing actions.
      */
-    @Synchronized
-    fun expireSessions(now: Long = System.currentTimeMillis()): Int {
+    fun expireSessions(now: Long = System.currentTimeMillis()): Int = synchronized(shared) {
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 "UPDATE sessions SET state = 'EXPIRED' WHERE state = 'ACTIVE' AND expiry_ms <= ?"
             ).use { ps ->
                 ps.setLong(1, now)
                 val rows = ps.executeUpdate()
-                conn.commit()
+                shared.conn.commit()
                 return rows
             }
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("expireSessions failed", e)
         }
     }
@@ -153,13 +148,12 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * SELECT and UPDATE use the same predicate within one transaction, so the
      * returned IDs are exactly the rows that were updated.
      */
-    @Synchronized
-    fun expireSessionsAndGetIds(now: Long = System.currentTimeMillis()): List<String> {
+    fun expireSessionsAndGetIds(now: Long = System.currentTimeMillis()): List<String> = synchronized(shared) {
         try {
-            conn.autoCommit = false
+            shared.conn.autoCommit = false
             // Collect IDs matching the expiry predicate before the update
             val ids = mutableListOf<String>()
-            conn.prepareStatement(
+            shared.conn.prepareStatement(
                 "SELECT session_id FROM sessions WHERE state = 'ACTIVE' AND expiry_ms <= ?"
             ).use { ps ->
                 ps.setLong(1, now)
@@ -169,17 +163,17 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
             }
             // Update the same predicate in the same transaction
             if (ids.isNotEmpty()) {
-                conn.prepareStatement(
+                shared.conn.prepareStatement(
                     "UPDATE sessions SET state = 'EXPIRED' WHERE state = 'ACTIVE' AND expiry_ms <= ?"
                 ).use { ps ->
                     ps.setLong(1, now)
                     ps.executeUpdate()
                 }
             }
-            conn.commit()
+            shared.conn.commit()
             return ids
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("expireSessionsAndGetIds failed", e)
         }
     }
@@ -188,20 +182,19 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * Explicitly close a session (e.g., user logout). State transitions to CLOSED.
      * Returns false if the session does not exist or is already EXPIRED/CLOSED.
      */
-    @Synchronized
-    fun closeSession(sessionId: String): Boolean {
+    fun closeSession(sessionId: String): Boolean = synchronized(shared) {
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 "UPDATE sessions SET state = 'CLOSED' WHERE session_id = ? AND state = 'ACTIVE'"
             ).use { ps ->
                 ps.setString(1, sessionId)
                 val rows = ps.executeUpdate()
-                conn.commit()
+                shared.conn.commit()
                 return rows > 0
             }
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("closeSession failed for $sessionId", e)
         }
     }
@@ -210,11 +203,10 @@ class SQLiteSessionRegistry(private val conn: Connection) : SessionRegistry {
      * Returns all session IDs currently in ACTIVE state.
      * Convenience method for callers that need to sweep active sessions.
      */
-    @Synchronized
-    fun activeSessions(): List<String> {
-        return runCatching {
+    fun activeSessions(): List<String> = synchronized(shared) {
+        runCatching {
             val ids = mutableListOf<String>()
-            conn.createStatement().use { stmt ->
+            shared.conn.createStatement().use { stmt ->
                 stmt.executeQuery("SELECT session_id FROM sessions WHERE state = 'ACTIVE'").use { rs ->
                     while (rs.next()) ids.add(rs.getString("session_id"))
                 }

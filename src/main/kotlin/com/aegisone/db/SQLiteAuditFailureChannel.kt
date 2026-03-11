@@ -2,7 +2,6 @@ package com.aegisone.db
 
 import com.aegisone.execution.AuditFailureChannel
 import com.aegisone.execution.AuditRecord
-import java.sql.Connection
 import java.sql.Types
 
 /**
@@ -16,21 +15,21 @@ import java.sql.Types
  * succeeds without exception. A false return causes the coordinator to cancel
  * the action with no external effect (step_1 failure path, I-3).
  *
- * Same threading model as SQLiteReceiptChannel: @Synchronized, single connection.
+ * Thread safety: synchronized on [shared]. All objects sharing the same
+ * SharedConnection use the same monitor.
  *
  * Source: receiptDurabilitySpec-v1.md §4; implementationMap §3.2 step_1
  */
-class SQLiteAuditFailureChannel(private val conn: Connection) : AuditFailureChannel {
+class SQLiteAuditFailureChannel(private val shared: SharedConnection) : AuditFailureChannel {
 
-    @Synchronized
-    override fun write(record: AuditRecord): Boolean {
-        return try {
-            conn.autoCommit = false
+    override fun write(record: AuditRecord): Boolean = synchronized(shared) {
+        try {
+            shared.conn.autoCommit = false
             insertRecord(record)
-            conn.commit()
+            shared.conn.commit()
             true
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             false
         }
     }
@@ -45,7 +44,7 @@ class SQLiteAuditFailureChannel(private val conn: Connection) : AuditFailureChan
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
 
-        conn.prepareStatement(sql).use { ps ->
+        shared.conn.prepareStatement(sql).use { ps ->
             fun str(pos: Int, v: String?) = if (v != null) ps.setString(pos, v) else ps.setNull(pos, Types.VARCHAR)
             fun int(pos: Int, v: Int?) = if (v != null) ps.setInt(pos, v) else ps.setNull(pos, Types.INTEGER)
 

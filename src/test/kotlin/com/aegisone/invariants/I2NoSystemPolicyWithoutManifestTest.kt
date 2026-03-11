@@ -9,6 +9,7 @@ import com.aegisone.broker.CapabilityBroker
 import com.aegisone.broker.GrantAuthority
 import com.aegisone.trust.BootSignal
 import com.aegisone.trust.TrustInit
+import com.aegisone.invariants.TestAuthorityDecisionChannel
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.DisplayName
 import kotlin.test.assertEquals
@@ -31,7 +32,8 @@ class I2NoSystemPolicyWithoutManifestTest {
     ): Pair<CapabilityBroker, TrustInit> {
         val key = byteArrayOf(1, 2, 3, 4)
         val trustInit = TrustInit(TestZoneAStore(manifest = TestManifests.valid(key = key), platformKey = key))
-        val broker = CapabilityBroker(receiptChannel, trustInit.identity, floor)
+        val broker = CapabilityBroker(receiptChannel, trustInit.identity, floor,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
         val signal = trustInit.verifyManifest()
         assert(signal is BootSignal.Verified)
         broker.initialize(signal)
@@ -48,7 +50,8 @@ class I2NoSystemPolicyWithoutManifestTest {
     fun systemPolicyBlockedInRestrictedState() {
         val receiptChannel = TestReceiptChannel()
         val trustInit = TrustInit(TestZoneAStore(manifest = TestManifests.signatureInvalid()))
-        val broker = CapabilityBroker(receiptChannel, trustInit.identity)
+        val broker = CapabilityBroker(receiptChannel, trustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         val signal = trustInit.verifyManifest()
         assert(signal is BootSignal.Failed)
@@ -127,7 +130,8 @@ class I2NoSystemPolicyWithoutManifestTest {
             platformKey = key,
             versionFloor = 1
         ))
-        val broker = CapabilityBroker(receiptChannel, trustInit.identity, floor)
+        val broker = CapabilityBroker(receiptChannel, trustInit.identity, floor,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
         broker.initialize(trustInit.verifyManifest())
         assertEquals(BrokerState.ACTIVE, broker.state)
 
@@ -195,7 +199,8 @@ class I2NoSystemPolicyWithoutManifestTest {
         val impostorTrustInit  = TrustInit(TestZoneAStore(manifest = TestManifests.valid(key = key), platformKey = key))
 
         val receiptA = TestReceiptChannel()
-        val broker = CapabilityBroker(receiptA, legitimateTrustInit.identity)
+        val broker = CapabilityBroker(receiptA, legitimateTrustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         val forgedSignal = impostorTrustInit.verifyManifest()
         assert(forgedSignal is BootSignal.Verified)
@@ -214,7 +219,8 @@ class I2NoSystemPolicyWithoutManifestTest {
         )
         val singleTrustInit = TrustInit(mutableStore)
         val receiptB = TestReceiptChannel()
-        val freshBroker = CapabilityBroker(receiptB, singleTrustInit.identity)
+        val freshBroker = CapabilityBroker(receiptB, singleTrustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         val signal1 = singleTrustInit.verifyManifest() as BootSignal.Verified  // seq=1
         val signal2 = singleTrustInit.verifyManifest() as BootSignal.Verified  // seq=2
@@ -242,7 +248,8 @@ class I2NoSystemPolicyWithoutManifestTest {
         )
         val trustInitC = TrustInit(mutableStoreC)
         val receiptC = TestReceiptChannel()
-        val brokerC = CapabilityBroker(receiptC, trustInitC.identity)
+        val brokerC = CapabilityBroker(receiptC, trustInitC.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         // Accept version=2
         val signalV2 = trustInitC.verifyManifest() as BootSignal.Verified

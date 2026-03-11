@@ -5,7 +5,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -31,18 +30,18 @@ class SessionRegistryIntegrationTest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
     private lateinit var registry: SQLiteSessionRegistry
 
     @BeforeEach
     fun setup() {
-        conn = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        registry = SQLiteSessionRegistry(conn)
+        shared = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        registry = SQLiteSessionRegistry(shared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     private val CERT = "cert-fingerprint-abc123"

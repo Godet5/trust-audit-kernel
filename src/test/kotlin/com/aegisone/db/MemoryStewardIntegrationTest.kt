@@ -13,7 +13,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -51,8 +50,8 @@ class MemoryStewardIntegrationTest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var reviewConn: Connection
-    private lateinit var receiptConn: Connection
+    private lateinit var reviewShared: SharedConnection
+    private lateinit var receiptShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -67,19 +66,19 @@ class MemoryStewardIntegrationTest {
 
     @BeforeEach
     fun setup() {
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipt.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipt.db").absolutePath)
 
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
-        receiptChannel  = SQLiteReceiptChannel(receiptConn)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
+        receiptChannel  = SQLiteReceiptChannel(receiptShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { reviewConn.close() }
-        runCatching { receiptConn.close() }
+        runCatching { reviewShared.close() }
+        runCatching { receiptShared.close() }
     }
 
     private fun steward(sessionId: String = SESSION_ID): MemorySteward = MemorySteward(
@@ -212,7 +211,7 @@ class MemoryStewardIntegrationTest {
         steward().onSessionExpired(SESSION_ID)
 
         // Verify the receipt was durably written to the real receipt DB
-        val count = receiptConn.createStatement().use { stmt ->
+        val count = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts WHERE receipt_type = 'ProposalStatusReceipt' " +
                 "AND artifact_id = '$ARTIFACT_ID' AND to_state = 'SUBMITTED'"

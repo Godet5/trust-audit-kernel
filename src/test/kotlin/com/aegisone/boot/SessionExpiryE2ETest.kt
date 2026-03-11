@@ -22,8 +22,9 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.aegisone.db.SharedConnection
+import com.aegisone.db.SQLiteAuthorityDecisionChannel
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -55,8 +56,8 @@ class SessionExpiryE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -75,17 +76,17 @@ class SessionExpiryE2ETest {
 
     @BeforeEach
     fun setup() {
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -110,8 +111,9 @@ class SessionExpiryE2ETest {
         )
         assertTrue(store.provision(record, PLATFORM_KEY, VERSION_FLOOR))
 
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
-        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel).boot()
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
+        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel,
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)).boot()
         assertTrue(bootResult is BootResult.Active, "Boot must succeed")
         val broker = (bootResult as BootResult.Active).broker
 
@@ -172,7 +174,7 @@ class SessionExpiryE2ETest {
             "Artifact must revert to SUBMITTED after expiry sweep")
 
         // ProposalStatusReceipt written durably to receipt DB
-        val receiptCount = receiptConn.createStatement().use { stmt ->
+        val receiptCount = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts " +
                 "WHERE receipt_type = 'ProposalStatusReceipt' " +

@@ -1,13 +1,17 @@
 package com.aegisone.boot
 
+import com.aegisone.db.SharedConnection
 import com.aegisone.db.SQLiteAuditFailureChannel
 import com.aegisone.db.SQLiteBootstrap
 import com.aegisone.db.SQLiteReceiptChannel
 import com.aegisone.execution.ActionRequest
+import com.aegisone.execution.ConflictAlert
+import com.aegisone.execution.ConflictChannel
 import com.aegisone.execution.CoordinatorResult
 import com.aegisone.execution.ExecutionCoordinator
+import com.aegisone.execution.CrashClass
 import com.aegisone.execution.TrackingExecutor
-import com.aegisone.invariants.TestReversibilityRegistry
+import com.aegisone.invariants.TestExecutionOutcomeRegistry
 import com.aegisone.invariants.TrackingResultSink
 import com.aegisone.receipt.ActionReceiptStatus
 import com.aegisone.receipt.Receipt
@@ -64,11 +68,12 @@ class AdversarialStorageFaultsE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var workingConn: Connection
+    private lateinit var workingConn: SharedConnection
 
     private val CAPABILITY = "WRITE_NOTE"
     private val AGENT_ID   = "exec-01"
     private val SESSION_ID = "sess-sf"
+    private val noOpConflict = object : ConflictChannel { override fun alert(alert: ConflictAlert) = true }
 
     @BeforeEach
     fun setup() {
@@ -86,11 +91,11 @@ class AdversarialStorageFaultsE2ETest {
         sessionId      = SESSION_ID
     )
 
-    /** Open a fresh DB and immediately close the connection. Returns a dead Connection. */
-    private fun closedConnection(): Connection {
-        val conn = SQLiteBootstrap.openAndInitialize(File(tempDir, "dead-${System.nanoTime()}.db").absolutePath)
-        conn.close()
-        return conn
+    /** Open a fresh DB and immediately close the connection. Returns a dead SharedConnection. */
+    private fun closedConnection(): SharedConnection {
+        val shared = SQLiteBootstrap.openAndInitialize(File(tempDir, "dead-${System.nanoTime()}.db").absolutePath)
+        shared.close()
+        return shared
     }
 
     // --- SF-1: closed audit connection → CANCELLED, no execution ---
@@ -106,6 +111,7 @@ class AdversarialStorageFaultsE2ETest {
             auditFailureChannel = auditChannel,
             receiptChannel      = receiptChannel,
             executor            = executor,
+            conflictChannel     = noOpConflict,
             resultSink          = sink
         ).execute(makeRequest())
 
@@ -117,22 +123,23 @@ class AdversarialStorageFaultsE2ETest {
             "Result sink must not be called on CANCELLED")
     }
 
-    // --- SF-2: step_3 fails, irreversible → UNAUDITED_IRREVERSIBLE ---
+    // --- SF-2: step_3 fails, INDETERMINATE (default) → UNAUDITED_IRREVERSIBLE ---
 
     @Test
-    fun `SF-2 step_3 receipt write fails irreversible — UNAUDITED_IRREVERSIBLE executor called delivery blocked`() {
+    fun `SF-2 step_3 receipt write fails indeterminate — UNAUDITED_IRREVERSIBLE executor called delivery blocked`() {
         // Audit channel (step_1) on working connection — PENDING write succeeds.
         // Receipt channel (step_3) on dead connection — ActionReceipt write fails.
         val auditChannel   = SQLiteAuditFailureChannel(workingConn)
         val receiptChannel = SQLiteReceiptChannel(closedConnection())
-        val executor = TrackingExecutor(succeeds = true)
+        // TrackingExecutor defaults to CrashClass.INDETERMINATE — safe default, no compensation path.
+        val executor = TrackingExecutor(succeeds = true, crashClass = CrashClass.INDETERMINATE)
         val sink     = TrackingResultSink()
 
-        // IrreversibleByDefault is the coordinator's built-in default.
         val result = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel      = receiptChannel,
             executor            = executor,
+            conflictChannel     = noOpConflict,
             resultSink          = sink
         ).execute(makeRequest())
 
@@ -144,43 +151,44 @@ class AdversarialStorageFaultsE2ETest {
             "Result sink must not be called — delivery is gated on receipt acknowledgment")
 
         // Audit trail: PENDING written (step_1 succeeded), then UnauditedIrreversible.
-        val auditTypes = auditRecordTypes(workingConn)
+        val auditTypes = auditRecordTypes(workingConn.conn)
         assertTrue(auditTypes.any { it == "Pending" },
             "PENDING record must be present — step_1 succeeded before the action ran")
         assertTrue(auditTypes.any { it == "UnauditedIrreversible" },
             "UnauditedIrreversible must be recorded — honest acknowledgment of unaudited completion")
     }
 
-    // --- SF-3: step_3 fails, reversible → FAILED, reverse called ---
+    // --- SF-3: step_3 fails, COMPENSATABLE → FAILED, compensate called ---
 
     @Test
-    fun `SF-3 step_3 receipt write fails reversible — FAILED reverse called delivery blocked`() {
+    fun `SF-3 step_3 receipt write fails compensatable — FAILED compensate called delivery blocked`() {
         val auditChannel   = SQLiteAuditFailureChannel(workingConn)
         val receiptChannel = SQLiteReceiptChannel(closedConnection())
-        val executor     = TrackingExecutor(succeeds = true)
+        val executor     = TrackingExecutor(succeeds = true, crashClass = CrashClass.COMPENSATABLE)
         val sink         = TrackingResultSink()
-        val reversibility = TestReversibilityRegistry().apply { register(CAPABILITY, reversible = true) }
+        val outcomeReg   = TestExecutionOutcomeRegistry(compensationSucceeds = true)
 
         val result = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel      = receiptChannel,
             executor            = executor,
-            reversibilityRegistry = reversibility,
+            outcomeRegistry     = outcomeReg,
+            conflictChannel     = noOpConflict,
             resultSink          = sink
         ).execute(makeRequest())
 
         assertEquals(CoordinatorResult.FAILED, result,
-            "Reversible action with failed receipt write must return FAILED after reversal")
+            "Compensatable action with failed receipt write must return FAILED after compensation")
         assertTrue(executor.wasExecuted,
             "Executor must have been called — action executed before the write failure")
-        assertEquals(1, reversibility.reverseCallCount,
-            "reverse() must be called exactly once — the action is undone on write failure")
+        assertEquals(1, outcomeReg.compensateCallCount,
+            "compensate() must be called exactly once — the action is undone on write failure")
         assertEquals(0, sink.deliveryCount,
-            "Result sink must not be called — reversal path never reaches delivery")
+            "Result sink must not be called — compensation path never reaches delivery")
 
-        // Audit trail: PENDING then Failed (reversal recorded).
-        assertEquals(listOf("Pending", "Failed"), auditRecordTypes(workingConn),
-            "Audit trail must record PENDING then Failed — the reversal failure path")
+        // Audit trail: PENDING then Failed (compensation recorded).
+        assertEquals(listOf("Pending", "Failed"), auditRecordTypes(workingConn.conn),
+            "Audit trail must record PENDING then Failed — the compensation failure path")
     }
 
     // --- SF-4: SQLITE_BUSY at step_1 → CANCELLED ---
@@ -209,6 +217,7 @@ class AdversarialStorageFaultsE2ETest {
                 auditFailureChannel = SQLiteAuditFailureChannel(workingConn),
                 receiptChannel      = SQLiteReceiptChannel(workingConn),
                 executor            = executor,
+                conflictChannel     = noOpConflict,
                 resultSink          = sink
             ).execute(makeRequest())
 
@@ -260,7 +269,7 @@ class AdversarialStorageFaultsE2ETest {
             "Second write with the same receipt_id must fail — UNIQUE index rejects the duplicate")
 
         // Confirm exactly one row exists for the known receipt_id.
-        val rowCount = workingConn.createStatement().use { stmt ->
+        val rowCount = workingConn.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts WHERE receipt_id = '$knownReceiptId'"
             ).use { rs -> rs.next(); rs.getInt(1) }

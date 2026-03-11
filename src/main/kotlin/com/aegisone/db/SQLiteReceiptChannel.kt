@@ -2,7 +2,6 @@ package com.aegisone.db
 
 import com.aegisone.receipt.Receipt
 import com.aegisone.receipt.ReceiptChannel
-import java.sql.Connection
 import java.sql.Types
 
 /**
@@ -18,22 +17,21 @@ import java.sql.Types
  * (applied by SQLiteBootstrap.openAndInitialize). This class does not re-apply
  * them — callers that bypass SQLiteBootstrap lose the guarantee.
  *
- * Thread safety: @Synchronized on write(). Single-connection model is correct
- * for Phase 0; replace with a connection pool when concurrency demands it.
+ * Thread safety: synchronized on [shared]. All objects sharing the same
+ * SharedConnection use the same monitor — no cross-object lock gap.
  *
  * Source: receiptDurabilitySpec-v1.md §4, §7
  */
-class SQLiteReceiptChannel(private val conn: Connection) : ReceiptChannel {
+class SQLiteReceiptChannel(private val shared: SharedConnection) : ReceiptChannel {
 
-    @Synchronized
-    override fun write(receipt: Receipt): Boolean {
-        return try {
-            conn.autoCommit = false
+    override fun write(receipt: Receipt): Boolean = synchronized(shared) {
+        try {
+            shared.conn.autoCommit = false
             insertReceipt(receipt)
-            conn.commit()
+            shared.conn.commit()
             true
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             false
         }
     }
@@ -49,7 +47,7 @@ class SQLiteReceiptChannel(private val conn: Connection) : ReceiptChannel {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """.trimIndent()
 
-        conn.prepareStatement(sql).use { ps ->
+        shared.conn.prepareStatement(sql).use { ps ->
             // Positional helpers — null for unused columns
             fun str(pos: Int, v: String?) = if (v != null) ps.setString(pos, v) else ps.setNull(pos, Types.VARCHAR)
             fun int(pos: Int, v: Int?) = if (v != null) ps.setInt(pos, v) else ps.setNull(pos, Types.INTEGER)

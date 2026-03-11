@@ -7,8 +7,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -46,21 +46,21 @@ class ArtifactStoreIntegrationTest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
     private lateinit var store: SQLiteArtifactStore
     private lateinit var lockMgr: SQLiteArtifactLockManager
 
     @BeforeEach
     fun setup() {
         val path = File(tempDir, "review.db").absolutePath
-        conn = ReviewDbBootstrap.openAndInitialize(path)
-        store = SQLiteArtifactStore(conn)
-        lockMgr = SQLiteArtifactLockManager(conn)
+        shared = ReviewDbBootstrap.openAndInitialize(path)
+        store = SQLiteArtifactStore(shared)
+        lockMgr = SQLiteArtifactLockManager(shared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     // === ArtifactStore ===
@@ -163,16 +163,27 @@ class ArtifactStoreIntegrationTest {
     }
 
     @Test
-    fun `ALM-6 lock transfer — second lock replaces holder`() {
-        lockMgr.lock("art-015", "sess-e")
-        lockMgr.lock("art-015", "sess-f")  // replace
-        assertEquals("sess-f", lockMgr.lockHolder("art-015"),
-            "Second lock() call must replace the previous holder")
+    fun `ALM-6 lock conflict — second session cannot steal lock`() {
+        assertTrue(lockMgr.lock("art-015", "sess-e"),
+            "First lock() must succeed on an unlocked artifact")
+        assertFalse(lockMgr.lock("art-015", "sess-f"),
+            "Conflicting lock() from a different session must be rejected")
+        assertEquals("sess-e", lockMgr.lockHolder("art-015"),
+            "Original holder must not be displaced by a conflicting lock attempt")
     }
 
     @Test
     fun `ALM-7 lockedBy returns empty list for session with no locks`() {
         assertTrue(lockMgr.lockedBy("sess-nobody").isEmpty())
+    }
+
+    @Test
+    fun `ALM-8 same-session re-lock is idempotent — returns true`() {
+        assertTrue(lockMgr.lock("art-016", "sess-i"))
+        assertTrue(lockMgr.lock("art-016", "sess-i"),
+            "Re-lock by the same session must return true")
+        assertEquals("sess-i", lockMgr.lockHolder("art-016"),
+            "Holder must remain unchanged after idempotent re-lock")
     }
 
     // === Cross-component: store + lock manager share the same connection ===

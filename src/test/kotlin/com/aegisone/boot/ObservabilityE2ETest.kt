@@ -20,8 +20,11 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.aegisone.db.SharedConnection
+import com.aegisone.execution.ConflictAlert
+import com.aegisone.execution.ConflictChannel
+import com.aegisone.invariants.TestAuthorityDecisionChannel
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -41,14 +44,16 @@ import kotlin.test.assertTrue
  * OBS-2: Boot failure — BootFailed in system_events with step and reason
  * OBS-3: Recovery telemetry — RecoveryCompleted in system_events with
  *         reconciliation status, expired_sessions, and ready_for_active
+ * OBS-4: Broker state transition — BrokerStateChanged in system_events with
+ *         from_state, to_state, manifest_version, reason on floor mismatch
  */
 class ObservabilityE2ETest {
 
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -60,17 +65,17 @@ class ObservabilityE2ETest {
 
     @BeforeEach
     fun setup() {
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -97,9 +102,9 @@ class ObservabilityE2ETest {
         val floorProvider = FileBackedVersionFloorProvider(zoneADir())
         provisionZoneA(store)
 
-        val receiptChannel  = SQLiteReceiptChannel(receiptConn)
-        val decisionChannel = SQLiteAuthorityDecisionChannel(receiptConn)
-        val eventChannel    = SQLiteSystemEventChannel(receiptConn)
+        val receiptChannel  = SQLiteReceiptChannel(receiptShared)
+        val decisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)
+        val eventChannel    = SQLiteSystemEventChannel(receiptShared)
 
         // Boot with all observability channels wired
         val bootResult = BootOrchestrator(
@@ -121,7 +126,7 @@ class ObservabilityE2ETest {
         assertTrue(denied == null, "Grant must be denied for unknown capability")
 
         // Verify: BootVerified event with correct manifest version
-        val bootEvents = receiptConn.createStatement().use { stmt ->
+        val bootEvents = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT manifest_version FROM system_events WHERE event_type = 'BootVerified'"
             ).use { rs ->
@@ -132,7 +137,7 @@ class ObservabilityE2ETest {
             "BootVerified event must record manifest_version = 1")
 
         // Verify: GrantIssued with correct capability and role
-        val issuedCount = receiptConn.createStatement().use { stmt ->
+        val issuedCount = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM authority_decisions " +
                 "WHERE decision_type = 'GrantIssued' " +
@@ -144,7 +149,7 @@ class ObservabilityE2ETest {
             "GrantIssued must be recorded for the successful grant")
 
         // Verify: GrantDenied with reason GRANT_NOT_IN_MANIFEST
-        val deniedRow = receiptConn.createStatement().use { stmt ->
+        val deniedRow = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT capability_name, reason, manifest_version FROM authority_decisions " +
                 "WHERE decision_type = 'GrantDenied'"
@@ -165,18 +170,19 @@ class ObservabilityE2ETest {
     fun `OBS-2 boot failure — BootFailed event recorded with step and reason`() {
         val store         = FileBackedZoneAStore(zoneADir())  // not provisioned
         val floorProvider = FileBackedVersionFloorProvider(zoneADir())
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
-        val eventChannel   = SQLiteSystemEventChannel(receiptConn)
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
+        val eventChannel   = SQLiteSystemEventChannel(receiptShared)
 
         val bootResult = BootOrchestrator(
             zoneAStore           = store,
             versionFloorProvider = floorProvider,
             receiptChannel       = receiptChannel,
-            systemEventChannel   = eventChannel
+            systemEventChannel   = eventChannel,
+            authorityDecisionChannel = TestAuthorityDecisionChannel()
         ).boot()
         assertTrue(bootResult is BootResult.Failed, "Boot must fail on unprovisioned Zone A")
 
-        val failedEvent = receiptConn.createStatement().use { stmt ->
+        val failedEvent = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT step, reason FROM system_events WHERE event_type = 'BootFailed'"
             ).use { rs ->
@@ -195,21 +201,21 @@ class ObservabilityE2ETest {
     @Test
     fun `OBS-3 recovery with orphaned PENDING — RecoveryCompleted event records REPAIRED status`() {
         // Inject an orphaned PENDING to force REPAIRED result
-        val auditChannel = SQLiteAuditFailureChannel(receiptConn)
+        val auditChannel = SQLiteAuditFailureChannel(receiptShared)
         assertTrue(auditChannel.write(AuditRecord.Pending(
             receiptId = "orphan-obs3", capabilityName = "WRITE_NOTE",
             agentId = "exec-obs", sessionId = "sess-obs", sequenceNumber = 1
         )))
 
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
-        val eventChannel   = SQLiteSystemEventChannel(receiptConn)
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
+        val eventChannel   = SQLiteSystemEventChannel(receiptShared)
 
         val result = StartupRecovery(
-            receiptConn     = receiptConn,
-            sessionRegistry = sessionRegistry,
-            artifactStore   = artifactStore,
-            lockManager     = lockMgr,
-            receiptChannel  = receiptChannel,
+            receiptShared      = receiptShared,
+            sessionRegistry    = sessionRegistry,
+            artifactStore      = artifactStore,
+            lockManager        = lockMgr,
+            receiptChannel     = receiptChannel,
             systemEventChannel = eventChannel
         ).run()
 
@@ -217,7 +223,7 @@ class ObservabilityE2ETest {
         assertTrue(result.readyForActive)
 
         // Verify: RecoveryCompleted event with correct fields
-        val eventRow = receiptConn.createStatement().use { stmt ->
+        val eventRow = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT reconciliation_status, expired_sessions, ready_for_active " +
                 "FROM system_events WHERE event_type = 'RecoveryCompleted'"
@@ -233,5 +239,61 @@ class ObservabilityE2ETest {
             "expired_sessions must be 0 (no stale sessions in this test)")
         assertEquals(1, eventRow.third,
             "ready_for_active must be 1 (true) for REPAIRED result")
+    }
+
+    // --- OBS-4: broker state transition durably recorded ---
+
+    @Test
+    fun `OBS-4 floor mismatch — BrokerStateChanged event persisted with correct fields`() {
+        val store         = FileBackedZoneAStore(zoneADir())
+        val floorProvider = FileBackedVersionFloorProvider(zoneADir())
+        provisionZoneA(store)
+
+        val receiptChannel  = SQLiteReceiptChannel(receiptShared)
+        val decisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)
+        val eventChannel    = SQLiteSystemEventChannel(receiptShared)
+
+        // Boot with all observability channels wired
+        val bootResult = BootOrchestrator(
+            zoneAStore              = store,
+            versionFloorProvider    = floorProvider,
+            receiptChannel          = receiptChannel,
+            systemEventChannel      = eventChannel,
+            authorityDecisionChannel = decisionChannel
+        ).boot()
+        assertTrue(bootResult is BootResult.Active, "Boot must succeed")
+        val broker = (bootResult as BootResult.Active).broker
+
+        // Raise the floor above the manifest version (1) to trigger ACTIVE→RESTRICTED
+        assertTrue(floorProvider.raise(5), "Floor raise must succeed")
+
+        // Attempt a grant — should be denied and emit BrokerStateChanged
+        val result = broker.issueGrant(CAPABILITY, AgentRole.EXECUTOR, GrantAuthority.SYSTEM_POLICY)
+        assertTrue(result == null, "Grant must be denied on floor mismatch")
+
+        // Verify: BrokerStateChanged event with correct fields in system_events
+        val eventRow = receiptShared.conn.createStatement().use { stmt ->
+            stmt.executeQuery(
+                "SELECT from_state, to_state, manifest_version, reason " +
+                "FROM system_events WHERE event_type = 'BrokerStateChanged'"
+            ).use { rs ->
+                if (rs.next()) object {
+                    val fromState = rs.getString("from_state")
+                    val toState = rs.getString("to_state")
+                    val manifestVersion = rs.getInt("manifest_version")
+                    val reason = rs.getString("reason")
+                }
+                else null
+            }
+        }
+        assertTrue(eventRow != null, "BrokerStateChanged event must be persisted in system_events")
+        assertEquals("ACTIVE", eventRow!!.fromState,
+            "from_state must be ACTIVE")
+        assertEquals("RESTRICTED", eventRow.toState,
+            "to_state must be RESTRICTED")
+        assertEquals(1, eventRow.manifestVersion,
+            "manifest_version must be the broker's verified version (1)")
+        assertTrue(eventRow.reason.contains("MANIFEST_VERSION_BELOW_FLOOR"),
+            "reason must identify the floor mismatch trigger")
     }
 }

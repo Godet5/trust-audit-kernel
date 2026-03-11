@@ -2,7 +2,6 @@ package com.aegisone.db
 
 import com.aegisone.broker.AuthorityDecision
 import com.aegisone.broker.AuthorityDecisionChannel
-import java.sql.Connection
 import java.sql.Types
 
 /**
@@ -16,26 +15,27 @@ import java.sql.Types
  * decisions best-effort — a failure here does not block the grant decision
  * itself (the grant was already issued or denied before record() is called).
  *
+ * Thread safety: synchronized on [shared].
+ *
  * Source: implementationMap-trust-and-audit-v1.md §2.2, observability extension
  */
-class SQLiteAuthorityDecisionChannel(private val conn: Connection) : AuthorityDecisionChannel {
+class SQLiteAuthorityDecisionChannel(private val shared: SharedConnection) : AuthorityDecisionChannel {
 
-    @Synchronized
-    override fun record(decision: AuthorityDecision): Boolean {
-        return try {
-            conn.autoCommit = false
+    override fun record(decision: AuthorityDecision): Boolean = synchronized(shared) {
+        try {
+            shared.conn.autoCommit = false
             insert(decision)
-            conn.commit()
+            shared.conn.commit()
             true
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             false
         }
     }
 
     private fun insert(decision: AuthorityDecision) {
         val now = System.currentTimeMillis()
-        conn.prepareStatement(
+        shared.conn.prepareStatement(
             """
             INSERT INTO authority_decisions (
                 decision_type, timestamp_ms, capability_name, target_role,

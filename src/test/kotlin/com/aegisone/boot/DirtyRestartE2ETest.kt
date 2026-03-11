@@ -16,8 +16,8 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.aegisone.db.SharedConnection
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
@@ -49,8 +49,8 @@ class DirtyRestartE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -63,19 +63,19 @@ class DirtyRestartE2ETest {
 
     @BeforeEach
     fun setup() {
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
-        receiptChannel  = SQLiteReceiptChannel(receiptConn)
-        auditChannel    = SQLiteAuditFailureChannel(receiptConn)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
+        receiptChannel  = SQLiteReceiptChannel(receiptShared)
+        auditChannel    = SQLiteAuditFailureChannel(receiptShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     // --- DR-1: three concurrent dirty-state scenarios repaired in one sweep ---
@@ -123,7 +123,7 @@ class DirtyRestartE2ETest {
 
         // --- Run startup recovery ---
         val result = StartupRecovery(
-            receiptConn     = receiptConn,
+            receiptShared   = receiptShared,
             sessionRegistry = sessionRegistry,
             artifactStore   = artifactStore,
             lockManager     = lockMgr,
@@ -146,7 +146,7 @@ class DirtyRestartE2ETest {
 
         // (a) Orphaned PENDING was marked FAILED — a Failed record with reason W1_ORPHANED_PENDING
         //     should now exist for the orphan receipt_id
-        val failedCount = receiptConn.createStatement().use { stmt ->
+        val failedCount = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM audit_failure_records " +
                 "WHERE record_type = 'Failed' AND receipt_id = '$orphanReceiptId'"
@@ -156,7 +156,7 @@ class DirtyRestartE2ETest {
             "Orphaned PENDING must be marked Failed by reconciliation")
 
         // (b) Missing summary was regenerated
-        val summaryCount = receiptConn.createStatement().use { stmt ->
+        val summaryCount = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipt_summaries " +
                 "WHERE receipt_id = '$noSummaryReceiptId' AND regenerated = 1"
@@ -174,7 +174,7 @@ class DirtyRestartE2ETest {
             "Artifact must revert to SUBMITTED after expiry sweep")
 
         // (c) ProposalStatusReceipt durably written for the reverted artifact
-        val proposalReceiptCount = receiptConn.createStatement().use { stmt ->
+        val proposalReceiptCount = receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts " +
                 "WHERE receipt_type = 'ProposalStatusReceipt' " +
@@ -199,7 +199,7 @@ class DirtyRestartE2ETest {
         )), "UnauditedIrreversible write must succeed")
 
         val result = StartupRecovery(
-            receiptConn     = receiptConn,
+            receiptShared   = receiptShared,
             sessionRegistry = sessionRegistry,
             artifactStore   = artifactStore,
             lockManager     = lockMgr,

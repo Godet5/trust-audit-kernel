@@ -5,9 +5,12 @@ import com.aegisone.db.SQLiteAuditFailureChannel
 import com.aegisone.db.SQLiteAuthorityDecisionChannel
 import com.aegisone.db.SQLiteBootstrap
 import com.aegisone.db.SQLiteReceiptChannel
+import com.aegisone.db.SharedConnection
 import com.aegisone.execution.ActionExecutor
 import com.aegisone.execution.ActionRequest
 import com.aegisone.execution.AgentSlot
+import com.aegisone.execution.ConflictAlert
+import com.aegisone.execution.ConflictChannel
 import com.aegisone.execution.CoordinatorResult
 import com.aegisone.execution.ExecutionCoordinator
 import com.aegisone.execution.RegistrationResult
@@ -16,7 +19,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -54,27 +56,28 @@ class StaleCapabilityRevocationTest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
     private lateinit var registry: SQLiteAgentRegistry
     private lateinit var decisionChannel: SQLiteAuthorityDecisionChannel
     private lateinit var receiptChannel: SQLiteReceiptChannel
     private lateinit var auditChannel: SQLiteAuditFailureChannel
 
     private var executorCallCount = 0
+    private val noOpConflict = object : ConflictChannel { override fun alert(alert: ConflictAlert) = true }
 
     @BeforeEach
     fun setup() {
-        conn            = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        decisionChannel = SQLiteAuthorityDecisionChannel(conn)
-        registry        = SQLiteAgentRegistry(conn, decisionChannel)
-        receiptChannel  = SQLiteReceiptChannel(conn)
-        auditChannel    = SQLiteAuditFailureChannel(conn)
+        shared          = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        decisionChannel = SQLiteAuthorityDecisionChannel(shared)
+        registry        = SQLiteAgentRegistry(shared, decisionChannel)
+        receiptChannel  = SQLiteReceiptChannel(shared)
+        auditChannel    = SQLiteAuditFailureChannel(shared)
         executorCallCount = 0
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     private fun coordinator() = ExecutionCoordinator(
@@ -86,6 +89,7 @@ class StaleCapabilityRevocationTest {
                 return true
             }
         },
+        conflictChannel = noOpConflict,
         agentRegistry = registry
     )
 
@@ -173,7 +177,7 @@ class StaleCapabilityRevocationTest {
         coordinator().execute(ActionRequest("WRITE_NOTE", "nobody-sc4", "sess-sc4"))
 
         // A PolicyViolation receipt must be durably written identifying the denial.
-        val violationRow = conn.createStatement().use { stmt ->
+        val violationRow = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT violation, detail FROM receipts " +
                 "WHERE receipt_type = 'PolicyViolation' " +
@@ -205,7 +209,8 @@ class StaleCapabilityRevocationTest {
                     executorCallCount++
                     return true
                 }
-            }
+            },
+            conflictChannel     = noOpConflict
             // agentRegistry omitted — defaults to null
         )
 

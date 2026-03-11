@@ -1,0 +1,4 @@
+# This directory holds the pre-extracted sqlite-jdbc native library for Android/Termux.
+# libsqlitejdbc.so is excluded from version control (.gitignore).
+# Run scripts/extract-sqlite-native.sh after cloning on Termux/Android to populate it.
+# On standard JVMs (Linux x86_64, macOS, Windows) this directory is not used.

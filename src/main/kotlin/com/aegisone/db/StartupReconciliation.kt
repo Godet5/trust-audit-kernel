@@ -3,6 +3,10 @@ package com.aegisone.db
 import com.aegisone.execution.ConflictAlert
 import com.aegisone.execution.ConflictChannel
 import java.sql.Connection
+// StartupReconciliation accepts SharedConnection for API consistency but accesses
+// the raw conn internally. It runs during boot in a single thread — no concurrent
+// writers exist at this point. The SharedConnection parameter ensures callers pass
+// the same object they wire into channel classes.
 import java.util.UUID
 
 /**
@@ -52,7 +56,8 @@ object StartupReconciliation {
      *
      * Returns [ReconciliationResult] indicating whether the coordinator may proceed.
      */
-    fun run(conn: Connection, conflictChannel: ConflictChannel? = null): ReconciliationResult {
+    fun run(shared: SharedConnection, conflictChannel: ConflictChannel? = null): ReconciliationResult {
+        val conn = shared.conn
 
         // Step 1: Identify PENDING records in AUDIT_FAILURE_CHANNEL that have no
         //         corresponding ActionReceipt in RECEIPT_CHANNEL (W1/W2 crash window).

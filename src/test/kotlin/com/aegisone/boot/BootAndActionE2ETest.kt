@@ -8,7 +8,11 @@ import com.aegisone.db.SQLiteReceiptChannel
 import com.aegisone.execution.ActionExecutor
 import com.aegisone.execution.ActionRequest
 import com.aegisone.execution.CoordinatorResult
+import com.aegisone.db.SharedConnection
+import com.aegisone.execution.ConflictAlert
+import com.aegisone.execution.ConflictChannel
 import com.aegisone.execution.ExecutionCoordinator
+import com.aegisone.db.SQLiteAuthorityDecisionChannel
 import com.aegisone.zonea.FileBackedVersionFloorProvider
 import com.aegisone.zonea.FileBackedZoneAStore
 import com.aegisone.zonea.GrantRecord
@@ -18,7 +22,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -44,7 +47,7 @@ class BootAndActionE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
 
     private val PLATFORM_KEY  = byteArrayOf(0x01, 0x02, 0x03, 0x04)
     private val VERSION_FLOOR = 1
@@ -54,12 +57,12 @@ class BootAndActionE2ETest {
 
     @BeforeEach
     fun setup() {
-        conn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        shared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -87,11 +90,12 @@ class BootAndActionE2ETest {
         val floorProvider = FileBackedVersionFloorProvider(zoneADir())
         provisionZoneA(store)
 
-        val receiptChannel = SQLiteReceiptChannel(conn)
-        val auditChannel   = SQLiteAuditFailureChannel(conn)
+        val receiptChannel = SQLiteReceiptChannel(shared)
+        val auditChannel   = SQLiteAuditFailureChannel(shared)
 
         // Boot
-        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel).boot()
+        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel,
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(shared)).boot()
         assertTrue(bootResult is BootResult.Active,
             "Boot must succeed with a valid provisioned manifest")
         val broker = (bootResult as BootResult.Active).broker
@@ -107,6 +111,9 @@ class BootAndActionE2ETest {
             receiptChannel      = receiptChannel,
             executor            = object : ActionExecutor {
                 override fun execute(request: ActionRequest) = true
+            },
+            conflictChannel     = object : ConflictChannel {
+                override fun alert(alert: ConflictAlert) = true
             }
         )
         val result = coordinator.execute(ActionRequest(CAPABILITY, AGENT_ID, SESSION_ID))
@@ -114,7 +121,7 @@ class BootAndActionE2ETest {
             "Coordinator must return SUCCESS for a happy-path reversible action")
 
         // Verify: ActionReceipt is durably in the receipt DB
-        val receiptCount = conn.createStatement().use { stmt ->
+        val receiptCount = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts " +
                 "WHERE receipt_type = 'ActionReceipt' " +
@@ -126,7 +133,7 @@ class BootAndActionE2ETest {
             "ActionReceipt must be durably written to SQLiteReceiptChannel after SUCCESS")
 
         // Verify: PENDING record is durably in the audit failure DB
-        val pendingCount = conn.createStatement().use { stmt ->
+        val pendingCount = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM audit_failure_records " +
                 "WHERE record_type = 'Pending' " +
@@ -143,9 +150,10 @@ class BootAndActionE2ETest {
     fun `E2E-2 unprovisioned Zone A — boot fails and reason identifies the step`() {
         val store         = FileBackedZoneAStore(zoneADir())  // no provision() call
         val floorProvider = FileBackedVersionFloorProvider(zoneADir())
-        val receiptChannel = SQLiteReceiptChannel(conn)
+        val receiptChannel = SQLiteReceiptChannel(shared)
 
-        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel).boot()
+        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel,
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(shared)).boot()
         assertTrue(bootResult is BootResult.Failed,
             "Boot must fail when Zone A has not been provisioned")
         assertTrue((bootResult as BootResult.Failed).reason.contains("ZONE_A_ACCESS"),

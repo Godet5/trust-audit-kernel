@@ -23,14 +23,14 @@ import java.sql.DriverManager
  */
 object ReviewDbBootstrap {
 
-    fun openAndInitialize(path: String): Connection {
+    fun openAndInitialize(path: String): SharedConnection {
         val conn = DriverManager.getConnection("jdbc:sqlite:$path")
         conn.createStatement().use { stmt ->
             stmt.execute("PRAGMA journal_mode=WAL")
             stmt.execute("PRAGMA synchronous=FULL")
         }
         applySchema(conn)
-        return conn
+        return SharedConnection(conn)
     }
 
     private fun applySchema(conn: Connection) {

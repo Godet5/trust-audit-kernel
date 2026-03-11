@@ -15,8 +15,8 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.aegisone.db.SharedConnection
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -55,19 +55,19 @@ class ManifestEvolutionE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
 
     private val PLATFORM_KEY = byteArrayOf(0x01, 0x02, 0x03, 0x04)
     private val CAPABILITY   = "WRITE_NOTE"
 
     @BeforeEach
     fun setup() {
-        conn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        shared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -91,7 +91,7 @@ class ManifestEvolutionE2ETest {
     ): BootResult = BootOrchestrator(
         zoneAStore               = store,
         versionFloorProvider     = floor,
-        receiptChannel           = SQLiteReceiptChannel(conn),
+        receiptChannel           = SQLiteReceiptChannel(shared),
         systemEventChannel       = events,
         authorityDecisionChannel = decisions
     ).boot()
@@ -102,8 +102,8 @@ class ManifestEvolutionE2ETest {
     fun `MU full evolution — floor blocks old manifest, v2 reboot restores authority, trail proves transition`() {
         val store     = FileBackedZoneAStore(zoneADir())
         val floor     = FileBackedVersionFloorProvider(zoneADir())
-        val decisions = SQLiteAuthorityDecisionChannel(conn)
-        val events    = SQLiteSystemEventChannel(conn)
+        val decisions = SQLiteAuthorityDecisionChannel(shared)
+        val events    = SQLiteSystemEventChannel(shared)
 
         // MU-1: boot on v1, issue grant — authority established under v1 at floor=1
         assertTrue(store.provision(makeRecord(1), PLATFORM_KEY, 1),
@@ -150,7 +150,7 @@ class ManifestEvolutionE2ETest {
         data class DecRow(
             val type: String, val manifestVersion: Int?, val floorVersion: Int?, val reason: String?
         )
-        val rows = conn.createStatement().use { stmt ->
+        val rows = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT decision_type, manifest_version, floor_version, reason " +
                 "FROM authority_decisions ORDER BY id"
@@ -193,7 +193,7 @@ class ManifestEvolutionE2ETest {
         assertNull(rows[3].reason)
 
         // system_events: three BootVerified — v1, v2, v2
-        val bootVersions = conn.createStatement().use { stmt ->
+        val bootVersions = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT manifest_version FROM system_events " +
                 "WHERE event_type = 'BootVerified' ORDER BY id"
@@ -213,8 +213,8 @@ class ManifestEvolutionE2ETest {
     fun `MU-BOOT-REJECTED floor blocks TrustInit on old manifest — BootFailed recorded, v2 resolves it`() {
         val store     = FileBackedZoneAStore(zoneADir())
         val floor     = FileBackedVersionFloorProvider(zoneADir())
-        val decisions = SQLiteAuthorityDecisionChannel(conn)
-        val events    = SQLiteSystemEventChannel(conn)
+        val decisions = SQLiteAuthorityDecisionChannel(shared)
+        val events    = SQLiteSystemEventChannel(shared)
 
         // Establish v1, confirm boot succeeds
         assertTrue(store.provision(makeRecord(1), PLATFORM_KEY, 1))
@@ -232,7 +232,7 @@ class ManifestEvolutionE2ETest {
             "Failure reason must identify VERSION_FLOOR")
 
         // BootFailed event recorded with correct step
-        val failedStep = conn.createStatement().use { stmt ->
+        val failedStep = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT step FROM system_events WHERE event_type = 'BootFailed'"
             ).use { rs -> if (rs.next()) rs.getString("step") else null }

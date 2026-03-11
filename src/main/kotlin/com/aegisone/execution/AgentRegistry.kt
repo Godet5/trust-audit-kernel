@@ -48,4 +48,18 @@ interface AgentRegistry {
 
     /** Slot of [agentId] if active, null if not registered. */
     fun slotOf(agentId: String): AgentSlot?
+
+    /**
+     * Atomically check that [agentId] is currently registered and execute [block]
+     * while holding the registration lock. Returns null if [agentId] is not
+     * registered (block is not called). Returns the block's result otherwise.
+     *
+     * Closes G-5a: the registration check and any subsequent action (e.g., writing
+     * PENDING) are part of the same serialized unit. A concurrent deregister() call
+     * cannot interleave between the check and the block's execution.
+     *
+     * Implementations must hold the same lock used by register()/deregister()
+     * throughout the duration of [block].
+     */
+    fun <T> checkAndBegin(agentId: String, block: () -> T): T?
 }

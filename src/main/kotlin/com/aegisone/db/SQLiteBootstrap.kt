@@ -19,14 +19,18 @@ import java.sql.DriverManager
  */
 object SQLiteBootstrap {
 
-    fun openAndInitialize(path: String): Connection {
+    fun openAndInitialize(path: String): SharedConnection {
         val conn = DriverManager.getConnection("jdbc:sqlite:$path")
         conn.createStatement().use { stmt ->
             stmt.execute("PRAGMA journal_mode=WAL")
             stmt.execute("PRAGMA synchronous=FULL")
+            // busy_timeout: wait up to 5s for SQLite write lock instead of
+            // returning SQLITE_BUSY immediately. Required for cross-process
+            // serialization via BEGIN IMMEDIATE (G-1 closure).
+            stmt.execute("PRAGMA busy_timeout=5000")
         }
         applySchema(conn)
-        return conn
+        return SharedConnection(conn)
     }
 
     private fun applySchema(conn: Connection) {
@@ -102,8 +106,8 @@ object SQLiteBootstrap {
             )
 
             // System lifecycle event store — structured operational events from
-            // orchestration components: boot outcomes, recovery results.
-            // One row per lifecycle transition.
+            // orchestration components: boot outcomes, recovery results, broker
+            // state transitions. One row per lifecycle transition.
             stmt.execute(
                 """
                 CREATE TABLE IF NOT EXISTS system_events (
@@ -116,6 +120,8 @@ object SQLiteBootstrap {
                     reconciliation_status TEXT,
                     expired_sessions      INTEGER,
                     ready_for_active      INTEGER,
+                    from_state            TEXT,
+                    to_state              TEXT,
                     inserted_at_ms        INTEGER NOT NULL
                 )
                 """.trimIndent()

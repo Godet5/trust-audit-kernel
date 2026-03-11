@@ -6,13 +6,13 @@ import com.aegisone.db.SQLiteArtifactStore
 import com.aegisone.db.SQLiteBootstrap
 import com.aegisone.db.SQLiteReceiptChannel
 import com.aegisone.db.SQLiteSessionRegistry
+import com.aegisone.db.SharedConnection
 import com.aegisone.review.ArtifactState
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -58,8 +58,8 @@ class CrossTableReviewCorruptionE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
     private lateinit var artifactStore: SQLiteArtifactStore
     private lateinit var lockMgr: SQLiteArtifactLockManager
     private lateinit var sessionRegistry: SQLiteSessionRegistry
@@ -67,33 +67,33 @@ class CrossTableReviewCorruptionE2ETest {
 
     @BeforeEach
     fun setup() {
-        receiptConn     = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn      = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        receiptChannel  = SQLiteReceiptChannel(receiptConn)
+        receiptShared   = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared    = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        receiptChannel  = SQLiteReceiptChannel(receiptShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     private fun runRecovery() = StartupRecovery(
-        receiptConn     = receiptConn,
+        receiptShared   = receiptShared,
         sessionRegistry = sessionRegistry,
         artifactStore   = artifactStore,
         lockManager     = lockMgr,
         receiptChannel  = receiptChannel,
-        reviewConn      = reviewConn
+        reviewConn      = reviewShared.conn
     ).run()
 
     /** Insert a row directly into the sessions table with a given state. */
     private fun insertSession(sessionId: String, state: String, expiryMs: Long = Long.MAX_VALUE) {
         val now = System.currentTimeMillis()
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO sessions (session_id, cert_fingerprint, state, created_at_ms, last_heartbeat_ms, expiry_ms) " +
             "VALUES (?, 'fp-test', ?, ?, ?, ?)"
         ).use { ps ->
@@ -108,7 +108,7 @@ class CrossTableReviewCorruptionE2ETest {
 
     /** Insert a lock entry directly, bypassing the normal lock acquisition path. */
     private fun insertLockDirect(artifactId: String, sessionId: String) {
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO artifact_locks (artifact_id, session_id, acquired_at_ms) VALUES (?, ?, ?)"
         ).use { ps ->
             ps.setString(1, artifactId)
@@ -119,7 +119,7 @@ class CrossTableReviewCorruptionE2ETest {
     }
 
     private fun proposalStatusReceipts(artifactId: String): List<Triple<String, String, String>> =
-        receiptConn.createStatement().use { stmt ->
+        receiptShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT artifact_id, from_state, to_state, changed_by FROM receipts " +
                 "WHERE receipt_type = 'ProposalStatusReceipt' AND artifact_id = '$artifactId'"

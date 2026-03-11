@@ -2,7 +2,6 @@ package com.aegisone.db
 
 import com.aegisone.review.ArtifactState
 import com.aegisone.review.ArtifactStore
-import java.sql.Connection
 
 /**
  * SQLite-backed ArtifactStore.
@@ -18,16 +17,16 @@ import java.sql.Connection
  *
  * Reads return null on missing or failed lookup (safe: callers already handle null).
  *
- * Thread safety: @Synchronized on all methods. Single-connection model for Phase 0.
+ * Thread safety: synchronized on [shared]. All objects sharing the same
+ * SharedConnection use the same monitor.
  *
  * Source: implementationMap-trust-and-audit-v1.md §4.4; reviewSystemSpec-v1.md §3
  */
-class SQLiteArtifactStore(private val conn: Connection) : ArtifactStore {
+class SQLiteArtifactStore(private val shared: SharedConnection) : ArtifactStore {
 
-    @Synchronized
-    override fun getState(artifactId: String): ArtifactState? {
-        return runCatching {
-            conn.prepareStatement(
+    override fun getState(artifactId: String): ArtifactState? = synchronized(shared) {
+        runCatching {
+            shared.conn.prepareStatement(
                 "SELECT state FROM artifacts WHERE artifact_id = ?"
             ).use { ps ->
                 ps.setString(1, artifactId)
@@ -38,11 +37,10 @@ class SQLiteArtifactStore(private val conn: Connection) : ArtifactStore {
         }.getOrNull()
     }
 
-    @Synchronized
-    override fun setState(artifactId: String, state: ArtifactState) {
+    override fun setState(artifactId: String, state: ArtifactState): Unit = synchronized(shared) {
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 """
                 INSERT OR REPLACE INTO artifacts (artifact_id, state, updated_at_ms)
                 VALUES (?, ?, ?)
@@ -53,18 +51,17 @@ class SQLiteArtifactStore(private val conn: Connection) : ArtifactStore {
                 ps.setLong(3, System.currentTimeMillis())
                 ps.executeUpdate()
             }
-            conn.commit()
+            shared.conn.commit()
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("setState failed for artifact $artifactId", e)
         }
     }
 
-    @Synchronized
-    override fun writeField(artifactId: String, field: String, value: String) {
+    override fun writeField(artifactId: String, field: String, value: String): Unit = synchronized(shared) {
         try {
-            conn.autoCommit = false
-            conn.prepareStatement(
+            shared.conn.autoCommit = false
+            shared.conn.prepareStatement(
                 """
                 INSERT OR REPLACE INTO artifact_fields
                     (artifact_id, field_name, field_value, updated_at_ms)
@@ -77,17 +74,16 @@ class SQLiteArtifactStore(private val conn: Connection) : ArtifactStore {
                 ps.setLong(4, System.currentTimeMillis())
                 ps.executeUpdate()
             }
-            conn.commit()
+            shared.conn.commit()
         } catch (e: Exception) {
-            runCatching { conn.rollback() }
+            runCatching { shared.conn.rollback() }
             throw IllegalStateException("writeField failed for artifact $artifactId field $field", e)
         }
     }
 
-    @Synchronized
-    override fun readField(artifactId: String, field: String): String? {
-        return runCatching {
-            conn.prepareStatement(
+    override fun readField(artifactId: String, field: String): String? = synchronized(shared) {
+        runCatching {
+            shared.conn.prepareStatement(
                 "SELECT field_value FROM artifact_fields WHERE artifact_id = ? AND field_name = ?"
             ).use { ps ->
                 ps.setString(1, artifactId)

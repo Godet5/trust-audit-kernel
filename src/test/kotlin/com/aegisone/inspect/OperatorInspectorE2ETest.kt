@@ -10,6 +10,7 @@ import com.aegisone.db.SQLiteArtifactLockManager
 import com.aegisone.db.SQLiteArtifactStore
 import com.aegisone.db.SQLiteAuditFailureChannel
 import com.aegisone.db.SQLiteAuthorityDecisionChannel
+import com.aegisone.db.SharedConnection
 import com.aegisone.db.SQLiteBootstrap
 import com.aegisone.db.SQLiteReceiptChannel
 import com.aegisone.db.SQLiteSessionRegistry
@@ -17,6 +18,8 @@ import com.aegisone.db.SQLiteSystemEventChannel
 import com.aegisone.execution.ActionExecutor
 import com.aegisone.execution.ActionRequest
 import com.aegisone.execution.AuditRecord
+import com.aegisone.execution.ConflictAlert
+import com.aegisone.execution.ConflictChannel
 import com.aegisone.execution.ExecutionCoordinator
 import com.aegisone.review.ArtifactState
 import com.aegisone.zonea.FileBackedVersionFloorProvider
@@ -28,7 +31,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -72,8 +74,8 @@ class OperatorInspectorE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -84,20 +86,21 @@ class OperatorInspectorE2ETest {
     private val CAPABILITY    = "WRITE_NOTE"
     private val AGENT_ID      = "exec-inspector"
     private val SESSION_ID    = "sess-inspector"
+    private val noOpConflict = object : ConflictChannel { override fun alert(alert: ConflictAlert) = true }
 
     @BeforeEach
     fun setup() {
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -115,9 +118,9 @@ class OperatorInspectorE2ETest {
         )
         assertTrue(store.provision(record, PLATFORM_KEY, VERSION_FLOOR))
 
-        val receiptChannel  = SQLiteReceiptChannel(receiptConn)
-        val decisionChannel = SQLiteAuthorityDecisionChannel(receiptConn)
-        val eventChannel    = SQLiteSystemEventChannel(receiptConn)
+        val receiptChannel  = SQLiteReceiptChannel(receiptShared)
+        val decisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)
+        val eventChannel    = SQLiteSystemEventChannel(receiptShared)
 
         val bootResult = BootOrchestrator(
             zoneAStore               = store,
@@ -142,7 +145,7 @@ class OperatorInspectorE2ETest {
         val denied = broker.issueGrant("UNKNOWN_CAP", AgentRole.EXECUTOR, GrantAuthority.SYSTEM_POLICY)
         assertNull(denied, "Grant must be denied for unknown capability")
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
 
         // Decisions
         val decisions = inspector.recentDecisions()
@@ -173,19 +176,20 @@ class OperatorInspectorE2ETest {
     fun `OI-2 recentReceipts shows ActionReceipt and recentAuditFailures shows PENDING after execute`() {
         provisionAndBoot()
 
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
-        val auditChannel   = SQLiteAuditFailureChannel(receiptConn)
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
+        val auditChannel   = SQLiteAuditFailureChannel(receiptShared)
 
         val coordinator = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel      = receiptChannel,
             executor            = object : ActionExecutor {
                 override fun execute(request: ActionRequest) = true
-            }
+            },
+            conflictChannel     = noOpConflict
         )
         coordinator.execute(ActionRequest(CAPABILITY, AGENT_ID, SESSION_ID))
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
 
         // Receipts
         val receipts = inspector.recentReceipts()
@@ -207,7 +211,7 @@ class OperatorInspectorE2ETest {
 
     @Test
     fun `OI-3 sessions shows ACTIVE session locks shows sessionState and artifacts shows lockHolder`() {
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
 
         // Open a session
         assertTrue(sessionRegistry.openSession("sess-oi3", "fp-oi3", Long.MAX_VALUE))
@@ -244,7 +248,7 @@ class OperatorInspectorE2ETest {
     @Test
     fun `OI-4 ghost lock — currentLocks shows sessionState null when session row is absent`() {
         // Inject a lock directly without creating a sessions row (ghost session)
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO artifact_locks (artifact_id, session_id, acquired_at_ms) VALUES (?, ?, ?)"
         ).use { ps ->
             ps.setString(1, "art-oi4-ghost")
@@ -253,7 +257,7 @@ class OperatorInspectorE2ETest {
             ps.executeUpdate()
         }
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
         val locks = inspector.currentLocks()
         val ghostLock = locks.find { it.artifactId == "art-oi4-ghost" }
         assertNotNull(ghostLock, "currentLocks() must include the ghost lock")
@@ -268,7 +272,7 @@ class OperatorInspectorE2ETest {
         // Boot writes a BootVerified event; no violations injected
         provisionAndBoot()
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
         val summary = inspector.recoverySummary()
 
         assertNotNull(summary.lastBootResult, "lastBootResult must not be null after boot")
@@ -291,7 +295,7 @@ class OperatorInspectorE2ETest {
         artifactStore.setState("art-oi6-nolock", ArtifactState.UNDER_REVIEW)
 
         // Violation B: ghost lock (no sessions row)
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO artifact_locks (artifact_id, session_id, acquired_at_ms) VALUES (?, ?, ?)"
         ).use { ps ->
             ps.setString(1, "art-oi6-ghost")
@@ -302,7 +306,7 @@ class OperatorInspectorE2ETest {
 
         // Violation C: EXPIRED session with outstanding lock
         val now = System.currentTimeMillis()
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO sessions (session_id, cert_fingerprint, state, created_at_ms, last_heartbeat_ms, expiry_ms) " +
             "VALUES (?, 'fp-oi6', 'EXPIRED', ?, ?, 1)"
         ).use { ps ->
@@ -311,7 +315,7 @@ class OperatorInspectorE2ETest {
             ps.setLong(3, now)
             ps.executeUpdate()
         }
-        reviewConn.prepareStatement(
+        reviewShared.conn.prepareStatement(
             "INSERT INTO artifact_locks (artifact_id, session_id, acquired_at_ms) VALUES (?, ?, ?)"
         ).use { ps ->
             ps.setString(1, "art-oi6-expired")
@@ -320,7 +324,7 @@ class OperatorInspectorE2ETest {
             ps.executeUpdate()
         }
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
         val summary = inspector.recoverySummary()
 
         assertEquals(1, summary.violationA, "violationA must count the stranded UNDER_REVIEW artifact")
@@ -328,7 +332,11 @@ class OperatorInspectorE2ETest {
         assertTrue(summary.violationB >= 1, "violationB must count the ghost lock")
         assertEquals(1, summary.violationC, "violationC must count the EXPIRED session with a lock")
         assertFalse(summary.isClean, "isClean must be false when violations exist")
-        assertFalse(summary.requiresHumanReview, "requiresHumanReview must be false — no UnauditedIrreversible")
+        // P4: requiresHumanReview now includes cross-table violations (violationA/B/C > 0),
+        // not just UnauditedIrreversible. These violations indicate state corruption that
+        // an operator should be aware of before the system goes ACTIVE.
+        assertTrue(summary.requiresHumanReview,
+            "requiresHumanReview must be true when cross-table violations exist (P4 fix)")
     }
 
     // --- OI-7: requiresHumanReview ---
@@ -337,13 +345,13 @@ class OperatorInspectorE2ETest {
     fun `OI-7 requiresHumanReview is true when UnauditedIrreversible record exists`() {
         // Inject an UnauditedIrreversible record directly (what the coordinator writes
         // when an irreversible action's receipt write fails)
-        val auditChannel = SQLiteAuditFailureChannel(receiptConn)
+        val auditChannel = SQLiteAuditFailureChannel(receiptShared)
         assertTrue(auditChannel.write(AuditRecord.UnauditedIrreversible(
             receiptId = "irrev-oi7",
             detail    = "RECEIPT_WRITE_FAILED for DELETE_ALL"
         )))
 
-        val inspector = SystemInspector(receiptConn, reviewConn)
+        val inspector = SystemInspector(receiptShared, reviewShared)
         val summary = inspector.recoverySummary()
 
         assertEquals(1, summary.unresolvedIrreversible,
@@ -359,7 +367,7 @@ class OperatorInspectorE2ETest {
     @Test
     fun `OI-8 inspector without reviewConn returns empty lists and minus-one for review fields`() {
         // Wire only receiptConn — review DB not provided
-        val inspector = SystemInspector(receiptConn)
+        val inspector = SystemInspector(receiptShared)
 
         assertTrue(inspector.sessions().isEmpty(),  "sessions() must return emptyList when reviewConn is absent")
         assertTrue(inspector.currentLocks().isEmpty(), "currentLocks() must return emptyList when reviewConn is absent")
@@ -370,9 +378,16 @@ class OperatorInspectorE2ETest {
         assertEquals(-1, summary.violationA,     "violationA must be -1 when reviewConn is absent")
         assertEquals(-1, summary.violationB,     "violationB must be -1 when reviewConn is absent")
         assertEquals(-1, summary.violationC,     "violationC must be -1 when reviewConn is absent")
-        // isClean treats -1 fields as <= 0, so a clean receipt state with no reviewConn is still clean
+        // P3: isClean requires !isDegraded. -1 fields mean the review DB was unavailable,
+        // so isDegraded=true and isClean=false. This is the correct behavior: "couldn't check"
+        // must never render as "all clear" (AOC-1 fix).
         assertEquals(0, summary.unresolvedIrreversible)
         assertEquals(0, summary.orphanedPending)
-        assertTrue(summary.isClean, "isClean must be true when no anomalies and all review fields are -1")
+        assertTrue(summary.isDegraded, "isDegraded must be true when review fields are -1 (P3 fix)")
+        assertFalse(summary.isClean, "isClean must be false when degraded — 'couldn't check' is not 'all clear' (P3 fix)")
+        // P4/RR-2: degraded mode forces requiresHumanReview — unknown state must never
+        // be silently assumed safe. "Couldn't check" = "must review."
+        assertTrue(summary.requiresHumanReview,
+            "requiresHumanReview must be true when degraded — unknown state requires human review (P4/RR-2)")
     }
 }

@@ -1,3 +1,5 @@
+import java.io.File
+
 plugins {
     kotlin("jvm") version "2.1.10"
 }
@@ -16,16 +18,21 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
 }
 
+// On Android/Termux, /tmp is outside the linker namespace trusted by the JVM.
+// sqlite-jdbc extracts its native lib to /tmp by default, causing dlopen to fail.
+// When running on Termux, point sqlite-jdbc at a pre-extracted copy in harness/native/.
+// On standard JVMs (Linux x86_64, macOS, Windows), sqlite-jdbc uses its own bundled native.
+val isTermux: Boolean = System.getenv("TERMUX_VERSION") != null ||
+    File("/data/data/com.termux").exists()
+
 tasks.test {
     useJUnitPlatform()
-    // On Android/Termux, /tmp is outside the linker namespace trusted by the
-    // Termux JVM. sqlite-jdbc extracts its native lib there by default, causing
-    // dlopen to fail. Point it at a pre-extracted copy in harness/native/ which
-    // is within the Termux data directory namespace.
-    jvmArgs(
-        "-Dorg.sqlite.lib.path=${projectDir}/native",
-        "-Dorg.sqlite.lib.name=libsqlitejdbc.so"
-    )
+    if (isTermux) {
+        jvmArgs(
+            "-Dorg.sqlite.lib.path=${projectDir}/native",
+            "-Dorg.sqlite.lib.name=libsqlitejdbc.so"
+        )
+    }
     testLogging {
         events("passed", "failed", "skipped")
         showStandardStreams = true

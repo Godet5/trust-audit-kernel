@@ -1,5 +1,6 @@
 package com.aegisone.boot
 
+import com.aegisone.db.SharedConnection
 import com.aegisone.db.SQLiteSessionRegistry
 import com.aegisone.db.StartupReconciliation
 import com.aegisone.db.StartupReconciliation.ReconciliationResult
@@ -51,7 +52,7 @@ import java.sql.Connection
  * Source: receiptDurabilitySpec-v1.md §7.1, implementationMap §4.4
  */
 class StartupRecovery(
-    private val receiptConn: Connection,
+    private val receiptShared: SharedConnection,
     private val sessionRegistry: SQLiteSessionRegistry,
     private val artifactStore: ArtifactStore,
     private val lockManager: ArtifactLockManager,
@@ -62,7 +63,7 @@ class StartupRecovery(
 ) {
     fun run(now: Long = System.currentTimeMillis()): StartupRecoveryResult {
         // Phase 1: reconcile receipt/audit state
-        val reconciliation = StartupReconciliation.run(receiptConn, conflictChannel)
+        val reconciliation = StartupReconciliation.run(receiptShared, conflictChannel)
 
         // Phase 2: expire stale review sessions and clean up review state.
         // MemorySteward is constructed here solely for onSessionExpired() access.

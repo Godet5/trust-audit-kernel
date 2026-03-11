@@ -3,6 +3,7 @@ package com.aegisone.invariants
 
 import com.aegisone.execution.ActionRequest
 import com.aegisone.execution.CoordinatorResult
+import com.aegisone.execution.CrashClass
 import com.aegisone.execution.ExecutionCoordinator
 import com.aegisone.execution.TrackingExecutor
 import org.junit.jupiter.api.Test
@@ -35,7 +36,8 @@ class I3PendingReceiptExecuteAcknowledgeTest {
         val coordinator = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel = receiptChannel,
-            executor = executor
+            executor = executor,
+            conflictChannel = TestConflictChannel()
         )
 
         val request = ActionRequest(
@@ -60,24 +62,23 @@ class I3PendingReceiptExecuteAcknowledgeTest {
     }
 
     // ---------------------------------------------------------------
-    // I3-T2: Executor succeeds; RECEIPT_CHANNEL write fails; action is reversible
-    //        → Action reversed; FAILED receipt to AUDIT_FAILURE_CHANNEL; result: FAILED
+    // I3-T2: Executor succeeds; RECEIPT_CHANNEL write fails; action is COMPENSATABLE
+    //        → Compensation called; FAILED audit record written; result: FAILED
     // ---------------------------------------------------------------
     @Test
-    @DisplayName("I3-T2: Reversible action reversed and result FAILED when receipt write fails")
-    fun reversibleActionReversedOnReceiptWriteFailure() {
+    @DisplayName("I3-T2: Compensatable action compensated and result FAILED when receipt write fails")
+    fun compensatableActionCompensatedOnReceiptWriteFailure() {
         val auditChannel = TestAuditFailureChannel(available = true)
         val receiptChannel = TestReceiptChannel(available = false)  // step_3 write will fail
-        val executor = TrackingExecutor(succeeds = true)
-        val reversibilityRegistry = TestReversibilityRegistry().apply {
-            register("FILE_WRITE", reversible = true)
-        }
+        val executor = TrackingExecutor(succeeds = true, crashClass = CrashClass.COMPENSATABLE)
+        val outcomeRegistry = TestExecutionOutcomeRegistry(compensationSucceeds = true)
 
         val coordinator = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel = receiptChannel,
             executor = executor,
-            reversibilityRegistry = reversibilityRegistry
+            outcomeRegistry = outcomeRegistry,
+            conflictChannel = TestConflictChannel()
         )
 
         val request = ActionRequest(
@@ -92,43 +93,40 @@ class I3PendingReceiptExecuteAcknowledgeTest {
         assertTrue(executor.wasExecuted,
             "Executor must have been called before receipt write failure")
 
-        // Result must be FAILED — the action was reversed
+        // Result must be FAILED — the action was compensated
         assertEquals(CoordinatorResult.FAILED, result,
-            "I-3 violation: result must be FAILED when receipt write fails on reversible action")
+            "I-3 violation: result must be FAILED when receipt write fails on compensatable action")
 
-        // Reversal must have been invoked
-        assertEquals(1, reversibilityRegistry.reverseCallCount,
-            "Reversal must be called exactly once")
+        // Compensation must have been invoked
+        assertEquals(1, outcomeRegistry.compensateCallCount,
+            "Compensation must be called exactly once")
 
         // PENDING record must exist (was written at step_1)
         assertEquals(1, auditChannel.pendingRecords().size,
             "PENDING record must have been written at step_1")
 
-        // FAILED audit record must exist — proving the reversal was recorded
+        // FAILED audit record must exist — proving the compensation was recorded
         assertEquals(1, auditChannel.failedRecords().size,
-            "FAILED audit record must be written after reversal")
+            "FAILED audit record must be written after compensation")
     }
 
     // ---------------------------------------------------------------
-    // I3-T3: Executor succeeds; RECEIPT_CHANNEL write fails; action is irreversible
+    // I3-T3: Executor succeeds; RECEIPT_CHANNEL write fails; action is INDETERMINATE
     //        → UNAUDITED_IRREVERSIBLE record written; CONFLICT_CHANNEL alert; no result delivered
     // ---------------------------------------------------------------
     @Test
-    @DisplayName("I3-T3: Irreversible action produces UNAUDITED_IRREVERSIBLE with no result delivered")
-    fun irreversibleActionUnauditedOnReceiptWriteFailure() {
+    @DisplayName("I3-T3: Indeterminate action produces UNAUDITED_IRREVERSIBLE with no result delivered")
+    fun indeterminateActionUnauditedOnReceiptWriteFailure() {
         val auditChannel = TestAuditFailureChannel(available = true)
         val receiptChannel = TestReceiptChannel(available = false)  // step_3 write will fail
         val conflictChannel = TestConflictChannel()
-        val executor = TrackingExecutor(succeeds = true)
-        val reversibilityRegistry = TestReversibilityRegistry().apply {
-            register("COMMS_SEND", reversible = false)  // irreversible: external message sent
-        }
+        // TrackingExecutor defaults to CrashClass.INDETERMINATE — external message sent, no recovery
+        val executor = TrackingExecutor(succeeds = true, crashClass = CrashClass.INDETERMINATE)
 
         val coordinator = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel = receiptChannel,
             executor = executor,
-            reversibilityRegistry = reversibilityRegistry,
             conflictChannel = conflictChannel
         )
 
@@ -145,11 +143,7 @@ class I3PendingReceiptExecuteAcknowledgeTest {
 
         // Result must signal no delivery — UNAUDITED_IRREVERSIBLE is not delivered to agent
         assertEquals(CoordinatorResult.UNAUDITED_IRREVERSIBLE, result,
-            "I-3 violation: wrong result for irreversible action with receipt failure")
-
-        // Reversal must NOT have been attempted — the action cannot be undone
-        assertEquals(0, reversibilityRegistry.reverseCallCount,
-            "Reversal must not be attempted for irreversible action")
+            "I-3 violation: wrong result for indeterminate action with receipt failure")
 
         // UNAUDITED_IRREVERSIBLE audit record must exist
         assertEquals(1, auditChannel.unauditedIrreversibleRecords().size,
@@ -157,7 +151,7 @@ class I3PendingReceiptExecuteAcknowledgeTest {
 
         // CONFLICT_CHANNEL alert must have been emitted
         assertEquals(1, conflictChannel.alerts.size,
-            "CONFLICT_CHANNEL alert must be emitted on irreversible audit failure")
+            "CONFLICT_CHANNEL alert must be emitted on indeterminate audit failure")
 
         // No ActionReceipt in RECEIPT_CHANNEL — the write failed
         assertEquals(0, receiptChannel.receipts.filterIsInstance<com.aegisone.receipt.Receipt.ActionReceipt>().size,
@@ -181,6 +175,7 @@ class I3PendingReceiptExecuteAcknowledgeTest {
             auditFailureChannel = TestAuditFailureChannel(available = true),
             receiptChannel = receiptChannel,
             executor = TrackingExecutor(succeeds = true),
+            conflictChannel = TestConflictChannel(),
             resultSink = resultSink
         )
 
@@ -192,22 +187,22 @@ class I3PendingReceiptExecuteAcknowledgeTest {
         assertEquals(1, receiptChannel.receipts.filterIsInstance<com.aegisone.receipt.Receipt.ActionReceipt>().size,
             "ActionReceipt must be present in channel at point of delivery")
 
-        // Part B: Receipt write fails → delivery must NOT occur (reversible action)
+        // Part B: Receipt write fails → delivery must NOT occur (compensatable action)
         val resultSinkB = TrackingResultSink()
-        val registryB = TestReversibilityRegistry().apply { register("FILE_READ", reversible = true) }
 
         val coordinatorB = ExecutionCoordinator(
             auditFailureChannel = TestAuditFailureChannel(available = true),
             receiptChannel = TestReceiptChannel(available = false),
-            executor = TrackingExecutor(succeeds = true),
-            reversibilityRegistry = registryB,
+            executor = TrackingExecutor(succeeds = true, crashClass = CrashClass.COMPENSATABLE),
+            outcomeRegistry = TestExecutionOutcomeRegistry(compensationSucceeds = true),
+            conflictChannel = TestConflictChannel(),
             resultSink = resultSinkB
         )
 
         coordinatorB.execute(ActionRequest("FILE_READ", "agent-01", "session-01"))
 
         assertEquals(0, resultSinkB.deliveryCount,
-            "I-3 violation: result delivered before receipt was acknowledged (reversible path)")
+            "I-3 violation: result delivered before receipt was acknowledged (compensatable path)")
 
         // Part C: Receipt write fails → delivery must NOT occur (irreversible action)
         val resultSinkC = TrackingResultSink()
@@ -239,7 +234,8 @@ class I3PendingReceiptExecuteAcknowledgeTest {
         val coordinator = ExecutionCoordinator(
             auditFailureChannel = auditChannel,
             receiptChannel = TestReceiptChannel(available = true),
-            executor = TrackingExecutor(succeeds = true)
+            executor = TrackingExecutor(succeeds = true),
+            conflictChannel = TestConflictChannel()
         )
 
         val n = 5

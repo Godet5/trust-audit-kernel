@@ -21,8 +21,9 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.aegisone.db.SharedConnection
+import com.aegisone.db.SQLiteAuthorityDecisionChannel
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -55,8 +56,8 @@ class ReviewSliceE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var receiptConn: Connection
-    private lateinit var reviewConn: Connection
+    private lateinit var receiptShared: SharedConnection
+    private lateinit var reviewShared: SharedConnection
 
     private lateinit var sessionRegistry: SQLiteSessionRegistry
     private lateinit var artifactStore: SQLiteArtifactStore
@@ -71,17 +72,17 @@ class ReviewSliceE2ETest {
 
     @BeforeEach
     fun setup() {
-        receiptConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
-        reviewConn  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
-        sessionRegistry = SQLiteSessionRegistry(reviewConn)
-        artifactStore   = SQLiteArtifactStore(reviewConn)
-        lockMgr         = SQLiteArtifactLockManager(reviewConn)
+        receiptShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        reviewShared  = ReviewDbBootstrap.openAndInitialize(File(tempDir, "review.db").absolutePath)
+        sessionRegistry = SQLiteSessionRegistry(reviewShared)
+        artifactStore   = SQLiteArtifactStore(reviewShared)
+        lockMgr         = SQLiteArtifactLockManager(reviewShared)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { receiptConn.close() }
-        runCatching { reviewConn.close() }
+        runCatching { receiptShared.close() }
+        runCatching { reviewShared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -131,10 +132,11 @@ class ReviewSliceE2ETest {
         val floorProvider = FileBackedVersionFloorProvider(zoneADir())
         provisionZoneA(store)
 
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
 
         // Boot
-        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel).boot()
+        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel,
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)).boot()
         assertTrue(bootResult is BootResult.Active, "Boot must succeed with valid provisioned manifest")
         val broker = (bootResult as BootResult.Active).broker
 
@@ -186,10 +188,11 @@ class ReviewSliceE2ETest {
         // Manifest is valid but does not include REVIEW_WRITE for MEMORY_STEWARD
         provisionZoneA(store, includeReviewWrite = false)
 
-        val receiptChannel = SQLiteReceiptChannel(receiptConn)
+        val receiptChannel = SQLiteReceiptChannel(receiptShared)
 
         // Boot succeeds — broker reaches ACTIVE state
-        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel).boot()
+        val bootResult = BootOrchestrator(store, floorProvider, receiptChannel,
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(receiptShared)).boot()
         assertTrue(bootResult is BootResult.Active,
             "Boot must succeed even when REVIEW_WRITE is absent from manifest")
         val broker = (bootResult as BootResult.Active).broker

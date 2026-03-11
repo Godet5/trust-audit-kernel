@@ -9,6 +9,7 @@ import com.aegisone.broker.CapabilityBroker
 import com.aegisone.broker.GrantAuthority
 import com.aegisone.trust.BootSignal
 import com.aegisone.trust.TrustInit
+import com.aegisone.invariants.TestAuthorityDecisionChannel
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.DisplayName
 import kotlin.test.assertEquals
@@ -33,7 +34,8 @@ class I1ManifestBeforeBrokerTest {
     @DisplayName("I1-T1: Broker rejects all grants when uninitialized (no TrustInit signal)")
     fun brokerRejectsGrantsBeforeTrustInitSignal() {
         val trustInit = TrustInit(TestZoneAStore())  // identity only; no verification called
-        val broker = CapabilityBroker(TestReceiptChannel(), trustInit.identity)
+        val broker = CapabilityBroker(TestReceiptChannel(), trustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         assertEquals(BrokerState.UNINITIALIZED, broker.state,
             "Broker must start in UNINITIALIZED state")
@@ -67,7 +69,8 @@ class I1ManifestBeforeBrokerTest {
     fun signatureFailurePreventsActiveState() {
         val store = TestZoneAStore(manifest = TestManifests.signatureInvalid())
         val trustInit = TrustInit(store)
-        val broker = CapabilityBroker(TestReceiptChannel(), trustInit.identity)
+        val broker = CapabilityBroker(TestReceiptChannel(), trustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         val signal = trustInit.verifyManifest()
 
@@ -139,7 +142,8 @@ class I1ManifestBeforeBrokerTest {
         // Single TrustInit — re-verification calls the same instance with updated Zone A
         val trustInit = TrustInit(mutableStore)
         val receiptChannel = TestReceiptChannel()
-        val broker = CapabilityBroker(receiptChannel, trustInit.identity)
+        val broker = CapabilityBroker(receiptChannel, trustInit.identity,
+            authorityDecisionChannel = TestAuthorityDecisionChannel())
 
         // First verification — version 1
         val signal1 = trustInit.verifyManifest()

@@ -10,12 +10,12 @@ import com.aegisone.zonea.FileBackedVersionFloorProvider
 import com.aegisone.zonea.FileBackedZoneAStore
 import com.aegisone.zonea.GrantRecord
 import com.aegisone.zonea.ManifestRecord
+import com.aegisone.db.SharedConnection
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -51,19 +51,19 @@ class ManifestCorruptionE2ETest {
     @TempDir
     lateinit var tempDir: File
 
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
 
     private val PLATFORM_KEY = byteArrayOf(0x01, 0x02, 0x03, 0x04)
     private val CAPABILITY   = "WRITE_NOTE"
 
     @BeforeEach
     fun setup() {
-        conn = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
+        shared = SQLiteBootstrap.openAndInitialize(File(tempDir, "receipts.db").absolutePath)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     private fun zoneADir() = File(tempDir, "zoneA")
@@ -86,13 +86,13 @@ class ManifestCorruptionE2ETest {
         BootOrchestrator(
             zoneAStore               = store,
             versionFloorProvider     = floor,
-            receiptChannel           = SQLiteReceiptChannel(conn),
-            systemEventChannel       = SQLiteSystemEventChannel(conn),
-            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(conn)
+            receiptChannel           = SQLiteReceiptChannel(shared),
+            systemEventChannel       = SQLiteSystemEventChannel(shared),
+            authorityDecisionChannel = SQLiteAuthorityDecisionChannel(shared)
         ).boot()
 
     private fun lastBootFailedStep(): String? =
-        conn.createStatement().use { stmt ->
+        shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT step FROM system_events WHERE event_type = 'BootFailed' ORDER BY id DESC LIMIT 1"
             ).use { rs -> if (rs.next()) rs.getString("step") else null }
@@ -251,7 +251,7 @@ class ManifestCorruptionE2ETest {
         assertTrue(recoveredBoot is BootResult.Active, "Boot must succeed after v2 is provisioned over the cleared state")
 
         // system_events: BootFailed then BootVerified — the trail tells the full story
-        val eventTypes = conn.createStatement().use { stmt ->
+        val eventTypes = shared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT event_type FROM system_events ORDER BY id"
             ).use { rs ->

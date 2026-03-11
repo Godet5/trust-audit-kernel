@@ -13,14 +13,19 @@ import java.util.UUID
  *
  * The coordinator enforces I-3 structurally.
  * Currently implemented:
- *   step_0: live registry check (closes G-5) — if agentRegistry is wired, the
- *           requesting agent must be currently registered; deregistered agents
- *           are denied with AGENT_NOT_REGISTERED and a PolicyViolation receipt.
- *           No PENDING is written for a denied agent.
+ *   step_0+1 (atomic): live registry check + PENDING write are fused into a single
+ *           registry-locked unit when agentRegistry is wired (closes G-5a). The
+ *           agent must be registered at the exact moment PENDING is written — no
+ *           concurrent deregister() can interleave between the check and the write.
+ *           Denied agents receive AGENT_NOT_REGISTERED + PolicyViolation; no PENDING.
  *   step_1: PENDING record durably written to AUDIT_FAILURE_CHANNEL before execution
  *   step_2: executor called only after step_1 acknowledged
  *   step_3: full ActionReceipt written to RECEIPT_CHANNEL after execution;
- *           on write failure: reversible → reverse + FAILED; irreversible → I3-T3
+ *           on write failure: routes by executor.crashClass —
+ *             ATOMIC        → FAILED (executor claims no-escape semantics)
+ *             COMPENSATABLE → outcomeRegistry.compensate(); success → FAILED;
+ *                             failure → UNAUDITED_IRREVERSIBLE + conflict alert
+ *             INDETERMINATE → UNAUDITED_IRREVERSIBLE + conflict alert (default)
  *   step_5: result delivered to ResultSink only after step_3 acknowledged (I3-T4)
  * Pending:
  *   step_4: summary written (best-effort) — I3-T5
@@ -36,8 +41,8 @@ class ExecutionCoordinator(
     private val auditFailureChannel: AuditFailureChannel,
     private val receiptChannel: ReceiptChannel,
     private val executor: ActionExecutor,
-    private val reversibilityRegistry: ReversibilityRegistry = IrreversibleByDefault,
-    private val conflictChannel: ConflictChannel = SilentConflictChannel,
+    private val outcomeRegistry: ExecutionOutcomeRegistry = NoCompensationRegistry,
+    private val conflictChannel: ConflictChannel,
     private val resultSink: ResultSink = NoOpResultSink,
     private val sequenceProvider: SequenceProvider = MonotonicSequenceProvider(),
     private val agentRegistry: AgentRegistry? = null
@@ -45,26 +50,10 @@ class ExecutionCoordinator(
     private var lastAcceptedSequence = 0
 
     fun execute(request: ActionRequest): CoordinatorResult {
-        // Step 0: Live registry check (G-5 closure).
-        // If a registry is wired, the requesting agent must be currently registered.
-        // This is checked before PENDING is written — a denied agent produces no
-        // PENDING record and the executor is never called.
-        if (agentRegistry != null && agentRegistry.slotOf(request.agentId) == null) {
-            receiptChannel.write(Receipt.PolicyViolation(
-                violation = "AGENT_NOT_REGISTERED",
-                detail    = "Agent '${request.agentId}' attempted to execute " +
-                            "'${request.capabilityName}' but is not currently registered; " +
-                            "authority revoked at deregistration time"
-            ))
-            return CoordinatorResult.AGENT_NOT_REGISTERED
-        }
-
         val receiptId = UUID.randomUUID().toString()
         val seq = sequenceProvider.next()
 
         // Detect sequence gap or reset: sequence must strictly increase.
-        // If it doesn't, emit a SEQUENCE_GAP_DETECTED conflict alert and proceed —
-        // a reset attempt is not grounds for cancellation; action is still logged.
         if (seq <= lastAcceptedSequence) {
             conflictChannel.alert(ConflictAlert(
                 type = "SEQUENCE_GAP_DETECTED",
@@ -75,17 +64,51 @@ class ExecutionCoordinator(
         }
         lastAcceptedSequence = seq
 
-        // Step 1: Write PENDING to AUDIT_FAILURE_CHANNEL.
-        // If this fails, cancel immediately — no external effect.
-        val pendingAcknowledged = auditFailureChannel.write(
-            AuditRecord.Pending(
-                receiptId = receiptId,
-                capabilityName = request.capabilityName,
-                agentId = request.agentId,
-                sessionId = request.sessionId,
-                sequenceNumber = seq
+        // Steps 0+1 (atomic): registration check fused with PENDING write.
+        //
+        // When agentRegistry is wired, checkAndBegin() holds the registry lock
+        // while executing the block — a concurrent deregister() cannot interleave
+        // between the live-registration check and the PENDING write (G-5a closure).
+        //
+        // When agentRegistry is null, behavior is unchanged: PENDING is written
+        // unconditionally (backward-compatible for callers that do not wire a registry).
+        val pendingAcknowledged: Boolean
+        if (agentRegistry != null) {
+            val result = agentRegistry.checkAndBegin(request.agentId) {
+                auditFailureChannel.write(
+                    AuditRecord.Pending(
+                        receiptId      = receiptId,
+                        capabilityName = request.capabilityName,
+                        agentId        = request.agentId,
+                        sessionId      = request.sessionId,
+                        sequenceNumber = seq
+                    )
+                )
+            }
+            if (result == null) {
+                // Agent was not registered at the time of the atomic check.
+                receiptChannel.write(Receipt.PolicyViolation(
+                    violation = "AGENT_NOT_REGISTERED",
+                    detail    = "Agent '${request.agentId}' attempted to execute " +
+                                "'${request.capabilityName}' but is not currently registered; " +
+                                "authority revoked at deregistration time"
+                ))
+                return CoordinatorResult.AGENT_NOT_REGISTERED
+            }
+            pendingAcknowledged = result
+        } else {
+            // No registry wired — write PENDING unconditionally.
+            pendingAcknowledged = auditFailureChannel.write(
+                AuditRecord.Pending(
+                    receiptId      = receiptId,
+                    capabilityName = request.capabilityName,
+                    agentId        = request.agentId,
+                    sessionId      = request.sessionId,
+                    sequenceNumber = seq
+                )
             )
-        )
+        }
+
         if (!pendingAcknowledged) {
             return CoordinatorResult.CANCELLED
         }
@@ -124,8 +147,7 @@ class ExecutionCoordinator(
         executionSucceeded: Boolean
     ): CoordinatorResult {
         if (!executionSucceeded) {
-            // Execution already failed; receipt write failure doesn't change the outcome.
-            // Write a FAILED audit record and return FAILED.
+            // Execution failed; receipt write failure does not change the outcome.
             auditFailureChannel.write(AuditRecord.Failed(
                 receiptId = receiptId,
                 reason = "RECEIPT_WRITE_FAILED_AFTER_EXECUTION_FAILURE"
@@ -134,41 +156,75 @@ class ExecutionCoordinator(
         }
 
         // Execution succeeded but receipt write failed.
-        return if (reversibilityRegistry.isReversible(request.capabilityName)) {
-            // Reversible: undo the action, record the failure, return FAILED.
-            reversibilityRegistry.reverse(request)
-            auditFailureChannel.write(AuditRecord.Failed(
-                receiptId = receiptId,
-                reason = "RECEIPT_WRITE_FAILED_ACTION_REVERSED"
-            ))
-            CoordinatorResult.FAILED
-        } else {
-            // Irreversible: write UNAUDITED_IRREVERSIBLE, emit conflict alert, no result delivered.
-            auditFailureChannel.write(AuditRecord.UnauditedIrreversible(
-                receiptId = receiptId,
-                detail = "Irreversible action completed but receipt write failed; " +
-                         "action cannot be undone"
-            ))
-            conflictChannel.alert(ConflictAlert(
-                type = "UNAUDITED_IRREVERSIBLE_ACTION",
-                detail = "Action ${request.capabilityName} completed with no durable receipt; " +
-                         "agent ${request.agentId}, session ${request.sessionId}",
-                receiptId = receiptId
-            ))
-            CoordinatorResult.UNAUDITED_IRREVERSIBLE
+        // Route on the executor's declared crash semantics.
+        return when (executor.crashClass) {
+            CrashClass.ATOMIC -> {
+                // Executor claims all-or-nothing semantics. A missing receipt means
+                // the action did not escape. Classify conservatively as FAILED.
+                auditFailureChannel.write(AuditRecord.Failed(
+                    receiptId = receiptId,
+                    reason = "RECEIPT_WRITE_FAILED_ATOMIC_EXECUTOR"
+                ))
+                CoordinatorResult.FAILED
+            }
+            CrashClass.COMPENSATABLE -> {
+                // Side effects may have occurred. Attempt compensation.
+                val compensated = outcomeRegistry.compensate(request)
+                if (compensated) {
+                    auditFailureChannel.write(AuditRecord.Failed(
+                        receiptId = receiptId,
+                        reason = "RECEIPT_WRITE_FAILED_ACTION_COMPENSATED"
+                    ))
+                    CoordinatorResult.FAILED
+                } else {
+                    // Compensation failed — downgrade to INDETERMINATE.
+                    recordUnauditedIrreversible(
+                        receiptId = receiptId,
+                        request = request,
+                        detail = "Compensatable action completed but receipt write failed " +
+                                 "and compensation failed; external state unknown"
+                    )
+                    CoordinatorResult.UNAUDITED_IRREVERSIBLE
+                }
+            }
+            CrashClass.INDETERMINATE -> {
+                // Side effects may have escaped with no recovery path.
+                recordUnauditedIrreversible(
+                    receiptId = receiptId,
+                    request = request,
+                    detail = "Indeterminate action completed but receipt write failed; " +
+                             "cannot determine whether side effects escaped"
+                )
+                CoordinatorResult.UNAUDITED_IRREVERSIBLE
+            }
         }
+    }
+
+    private fun recordUnauditedIrreversible(
+        receiptId: String,
+        request: ActionRequest,
+        detail: String
+    ) {
+        auditFailureChannel.write(AuditRecord.UnauditedIrreversible(
+            receiptId = receiptId,
+            detail = detail
+        ))
+        conflictChannel.alert(ConflictAlert(
+            type = "UNAUDITED_IRREVERSIBLE_ACTION",
+            detail = "Action ${request.capabilityName} completed with no durable receipt; " +
+                     "agent ${request.agentId}, session ${request.sessionId}",
+            receiptId = receiptId
+        ))
     }
 }
 
-/** Safe default: all actions are irreversible unless explicitly registered otherwise. */
-private object IrreversibleByDefault : ReversibilityRegistry {
-    override fun isReversible(capabilityName: String) = false
-    override fun reverse(request: ActionRequest) = false
-}
-
-/** No-op conflict channel used when no conflict channel is wired (test/default). */
-private object SilentConflictChannel : ConflictChannel {
-    override fun alert(alert: ConflictAlert) = true
+/**
+ * Safe default: no compensation handlers are registered.
+ * A COMPENSATABLE executor with no registry wired will have compensation return false,
+ * escalating to UNAUDITED_IRREVERSIBLE. This prevents silent swallowing of unknown outcomes.
+ */
+private object NoCompensationRegistry : ExecutionOutcomeRegistry {
+    override fun compensate(request: ActionRequest) = false
 }
 
 /** No-op result sink used when no sink is wired (existing tests, default). */

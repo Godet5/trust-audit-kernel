@@ -9,8 +9,14 @@ import com.aegisone.review.ArtifactLockManager
 class TestArtifactLockManager : ArtifactLockManager {
     private val locks = mutableMapOf<String, String>()  // artifactId → sessionId
 
-    fun lock(artifactId: String, sessionId: String) {
-        locks[artifactId] = sessionId
+    fun lock(artifactId: String, sessionId: String): Boolean {
+        val current = locks[artifactId]
+        return if (current == null || current == sessionId) {
+            locks[artifactId] = sessionId
+            true
+        } else {
+            false  // different session holds it — no displacement
+        }
     }
 
     override fun release(artifactId: String) {

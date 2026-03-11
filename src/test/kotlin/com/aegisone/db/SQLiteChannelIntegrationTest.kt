@@ -8,7 +8,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -31,28 +30,28 @@ class SQLiteChannelIntegrationTest {
     lateinit var tempDir: File
 
     private lateinit var dbPath: String
-    private lateinit var writeConn: Connection
-    private lateinit var readConn: Connection
+    private lateinit var writeShared: SharedConnection
+    private lateinit var readShared: SharedConnection
 
     @BeforeEach
     fun setup() {
         dbPath = File(tempDir, "aegis-test.db").absolutePath
-        writeConn = SQLiteBootstrap.openAndInitialize(dbPath)
+        writeShared = SQLiteBootstrap.openAndInitialize(dbPath)
         // Separate read connection to verify durability independently of the write connection
-        readConn = SQLiteBootstrap.openAndInitialize(dbPath)
+        readShared = SQLiteBootstrap.openAndInitialize(dbPath)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { writeConn.close() }
-        runCatching { readConn.close() }
+        runCatching { writeShared.close() }
+        runCatching { readShared.close() }
     }
 
     // --- ReceiptChannel ---
 
     @Test
     fun `RC-1 ActionReceipt write returns true and row is queryable`() {
-        val channel = SQLiteReceiptChannel(writeConn)
+        val channel = SQLiteReceiptChannel(writeShared)
         val receipt = Receipt.ActionReceipt(
             receiptId = "rcpt-001",
             status = ActionReceiptStatus.SUCCESS,
@@ -65,7 +64,7 @@ class SQLiteChannelIntegrationTest {
         assertTrue(ack, "write() must return true on committed transaction")
 
         // Verify via independent read connection
-        val count = readConn.createStatement().use { stmt ->
+        val count = readShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM receipts WHERE receipt_id = 'rcpt-001' AND receipt_type = 'ActionReceipt'"
             ).use { rs -> rs.next(); rs.getInt(1) }
@@ -75,12 +74,12 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `RC-2 PolicyViolation write is persisted with correct type discriminator`() {
-        val channel = SQLiteReceiptChannel(writeConn)
+        val channel = SQLiteReceiptChannel(writeShared)
         val receipt = Receipt.PolicyViolation(violation = "CAPABILITY_DENIED", detail = "Agent lacks grant")
         val ack = channel.write(receipt)
         assertTrue(ack)
 
-        val type = readConn.createStatement().use { stmt ->
+        val type = readShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT receipt_type FROM receipts ORDER BY id DESC LIMIT 1"
             ).use { rs -> rs.next(); rs.getString(1) }
@@ -90,23 +89,23 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `RC-3 write on closed connection returns false and does not throw`() {
-        val closedConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "closed.db").absolutePath)
-        closedConn.close()
-        val channel = SQLiteReceiptChannel(closedConn)
+        val closedShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "closed.db").absolutePath)
+        closedShared.close()
+        val channel = SQLiteReceiptChannel(closedShared)
         val result = channel.write(Receipt.Anomaly(type = "TEST", detail = "should fail"))
         assertFalse(result, "write() on closed connection must return false, not throw")
     }
 
     @Test
     fun `RC-4 ManifestFailure and Anomaly and ProposalStatusReceipt all persist`() {
-        val channel = SQLiteReceiptChannel(writeConn)
+        val channel = SQLiteReceiptChannel(writeShared)
         assertTrue(channel.write(Receipt.ManifestFailure(step = "verify_signature", reason = "sig mismatch")))
         assertTrue(channel.write(Receipt.Anomaly(type = "SEQ_GAP", detail = "gap at 5")))
         assertTrue(channel.write(Receipt.ProposalStatusReceipt(
             artifactId = "art-1", fromState = "SUBMITTED", toState = "APPROVED", changedBy = "reviewer-x"
         )))
 
-        val count = readConn.createStatement().use { stmt ->
+        val count = readShared.conn.createStatement().use { stmt ->
             stmt.executeQuery("SELECT COUNT(*) FROM receipts").use { rs -> rs.next(); rs.getInt(1) }
         }
         assertEquals(3, count, "All three receipt subtypes must be stored")
@@ -116,7 +115,7 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `AFC-1 Pending record write returns true and row is queryable`() {
-        val channel = SQLiteAuditFailureChannel(writeConn)
+        val channel = SQLiteAuditFailureChannel(writeShared)
         val record = AuditRecord.Pending(
             receiptId = "rcpt-002",
             capabilityName = "NET_REQUEST",
@@ -127,7 +126,7 @@ class SQLiteChannelIntegrationTest {
         val ack = channel.write(record)
         assertTrue(ack)
 
-        val count = readConn.createStatement().use { stmt ->
+        val count = readShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM audit_failure_records WHERE receipt_id = 'rcpt-002' AND record_type = 'Pending'"
             ).use { rs -> rs.next(); rs.getInt(1) }
@@ -137,11 +136,11 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `AFC-2 Failed and UnauditedIrreversible records persist with correct type`() {
-        val channel = SQLiteAuditFailureChannel(writeConn)
+        val channel = SQLiteAuditFailureChannel(writeShared)
         assertTrue(channel.write(AuditRecord.Failed(receiptId = "rcpt-003", reason = "receipt write failed")))
         assertTrue(channel.write(AuditRecord.UnauditedIrreversible(receiptId = "rcpt-004", detail = "irreversible with no receipt")))
 
-        val types = readConn.createStatement().use { stmt ->
+        val types = readShared.conn.createStatement().use { stmt ->
             val result = mutableListOf<String>()
             stmt.executeQuery("SELECT record_type FROM audit_failure_records ORDER BY id").use { rs ->
                 while (rs.next()) result.add(rs.getString(1))
@@ -153,9 +152,9 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `AFC-3 write on closed connection returns false and does not throw`() {
-        val closedConn = SQLiteBootstrap.openAndInitialize(File(tempDir, "closed2.db").absolutePath)
-        closedConn.close()
-        val channel = SQLiteAuditFailureChannel(closedConn)
+        val closedShared = SQLiteBootstrap.openAndInitialize(File(tempDir, "closed2.db").absolutePath)
+        closedShared.close()
+        val channel = SQLiteAuditFailureChannel(closedShared)
         val result = channel.write(AuditRecord.Failed(receiptId = "x", reason = "test"))
         assertFalse(result)
     }
@@ -164,14 +163,14 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `SR-1 clean DB returns CLEAN`() {
-        val result = StartupReconciliation.run(writeConn)
+        val result = StartupReconciliation.run(writeShared)
         assertEquals(StartupReconciliation.ReconciliationResult.CLEAN, result)
     }
 
     @Test
     fun `SR-2 orphaned PENDING is marked FAILED — returns REPAIRED`() {
         // Write a PENDING record with no matching ActionReceipt
-        val afc = SQLiteAuditFailureChannel(writeConn)
+        val afc = SQLiteAuditFailureChannel(writeShared)
         assertTrue(afc.write(AuditRecord.Pending(
             receiptId = "orphan-001",
             capabilityName = "FILE_WRITE",
@@ -180,12 +179,12 @@ class SQLiteChannelIntegrationTest {
             sequenceNumber = 1
         )))
 
-        val result = StartupReconciliation.run(writeConn)
+        val result = StartupReconciliation.run(writeShared)
         assertEquals(StartupReconciliation.ReconciliationResult.REPAIRED, result,
             "Orphaned PENDING with no ActionReceipt must produce REPAIRED")
 
         // Failed record should now exist
-        val failedCount = readConn.createStatement().use { stmt ->
+        val failedCount = readShared.conn.createStatement().use { stmt ->
             stmt.executeQuery(
                 "SELECT COUNT(*) FROM audit_failure_records WHERE receipt_id = 'orphan-001' AND record_type = 'Failed'"
             ).use { rs -> rs.next(); rs.getInt(1) }
@@ -195,8 +194,8 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `SR-3 PENDING with matching ActionReceipt is not orphaned`() {
-        val afc = SQLiteAuditFailureChannel(writeConn)
-        val rc = SQLiteReceiptChannel(readConn) // separate connection, same DB
+        val afc = SQLiteAuditFailureChannel(writeShared)
+        val rc = SQLiteReceiptChannel(readShared) // separate connection, same DB
 
         // Write PENDING
         assertTrue(afc.write(AuditRecord.Pending(
@@ -217,7 +216,7 @@ class SQLiteChannelIntegrationTest {
             sequenceNumber = 1
         )))
 
-        val result = StartupReconciliation.run(writeConn)
+        val result = StartupReconciliation.run(writeShared)
         // Step 3 (summary gap) now runs: the ActionReceipt has no summary yet, so a
         // summary is regenerated and REPAIRED is returned. The original intent of this
         // test — that a matched PENDING+ActionReceipt is NOT classified as orphaned —
@@ -230,13 +229,13 @@ class SQLiteChannelIntegrationTest {
 
     @Test
     fun `SR-4 UnauditedIrreversible record blocks coordinator — returns UNRESOLVED_FAILURES`() {
-        val afc = SQLiteAuditFailureChannel(writeConn)
+        val afc = SQLiteAuditFailureChannel(writeShared)
         assertTrue(afc.write(AuditRecord.UnauditedIrreversible(
             receiptId = "irrev-001",
             detail = "FILE_DELETE completed without receipt"
         )))
 
-        val result = StartupReconciliation.run(writeConn)
+        val result = StartupReconciliation.run(writeShared)
         assertEquals(StartupReconciliation.ReconciliationResult.UNRESOLVED_FAILURES, result,
             "Unresolved UNAUDITED_IRREVERSIBLE must block coordinator from going ACTIVE")
     }

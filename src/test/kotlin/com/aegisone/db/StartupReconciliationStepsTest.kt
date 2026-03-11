@@ -10,7 +10,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
-import java.sql.Connection
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -37,17 +36,17 @@ class StartupReconciliationStepsTest {
     lateinit var tempDir: File
 
     private lateinit var dbPath: String
-    private lateinit var conn: Connection
+    private lateinit var shared: SharedConnection
 
     @BeforeEach
     fun setup() {
         dbPath = File(tempDir, "recon-test.db").absolutePath
-        conn = SQLiteBootstrap.openAndInitialize(dbPath)
+        shared = SQLiteBootstrap.openAndInitialize(dbPath)
     }
 
     @AfterEach
     fun teardown() {
-        runCatching { conn.close() }
+        runCatching { shared.close() }
     }
 
     // --- helpers ---
@@ -58,7 +57,7 @@ class StartupReconciliationStepsTest {
         sessionId: String = "sess-1",
         sequenceNumber: Int = 1
     ) {
-        SQLiteReceiptChannel(conn).write(Receipt.ActionReceipt(
+        SQLiteReceiptChannel(shared).write(Receipt.ActionReceipt(
             receiptId       = receiptId,
             status          = ActionReceiptStatus.SUCCESS,
             capabilityName  = "FILE_READ",
@@ -74,7 +73,7 @@ class StartupReconciliationStepsTest {
         sessionId: String = "sess-1",
         sequenceNumber: Int = 1
     ) {
-        SQLiteAuditFailureChannel(conn).write(AuditRecord.Pending(
+        SQLiteAuditFailureChannel(shared).write(AuditRecord.Pending(
             receiptId      = receiptId,
             capabilityName = "FILE_READ",
             agentId        = agentId,
@@ -84,7 +83,7 @@ class StartupReconciliationStepsTest {
     }
 
     private fun countRows(table: String, whereClause: String = "1=1"): Int =
-        conn.createStatement().use { stmt ->
+        shared.conn.createStatement().use { stmt ->
             stmt.executeQuery("SELECT COUNT(*) FROM $table WHERE $whereClause").use { rs ->
                 rs.next(); rs.getInt(1)
             }
@@ -105,7 +104,7 @@ class StartupReconciliationStepsTest {
     fun `SR-5 ActionReceipt with no summary triggers regeneration — REPAIRED`() {
         writeActionReceipt("rcpt-001")
 
-        val result = StartupReconciliation.run(conn)
+        val result = StartupReconciliation.run(shared)
         assertEquals(StartupReconciliation.ReconciliationResult.REPAIRED, result,
             "Missing summary for an ActionReceipt must produce REPAIRED")
     }
@@ -115,10 +114,10 @@ class StartupReconciliationStepsTest {
         writeActionReceipt("rcpt-002")
 
         // First run regenerates the summary
-        StartupReconciliation.run(conn)
+        StartupReconciliation.run(shared)
 
         // Second run: summary exists; nothing to regenerate
-        val result = StartupReconciliation.run(conn)
+        val result = StartupReconciliation.run(shared)
         assertEquals(StartupReconciliation.ReconciliationResult.CLEAN, result,
             "No new gaps after first regeneration must produce CLEAN")
     }
@@ -127,7 +126,7 @@ class StartupReconciliationStepsTest {
     fun `SR-7 Regenerated summary is durably written to receipt_summaries`() {
         writeActionReceipt("rcpt-003", agentId = "agent-x", sessionId = "sess-x")
 
-        StartupReconciliation.run(conn)
+        StartupReconciliation.run(shared)
 
         val count = countRows("receipt_summaries",
             "receipt_id = 'rcpt-003' AND regenerated = 1")
@@ -138,7 +137,7 @@ class StartupReconciliationStepsTest {
     fun `SR-8 SummaryRegenerated event logged to audit_failure_records`() {
         writeActionReceipt("rcpt-004")
 
-        StartupReconciliation.run(conn)
+        StartupReconciliation.run(shared)
 
         val count = countRows("audit_failure_records",
             "record_type = 'SummaryRegenerated' AND receipt_id = 'rcpt-004'")
@@ -154,7 +153,7 @@ class StartupReconciliationStepsTest {
         writeActionReceipt("rcpt-012", sequenceNumber = 3)
 
         val channel = CapturingConflictChannel()
-        StartupReconciliation.run(conn, channel)
+        StartupReconciliation.run(shared, channel)
 
         assertTrue(channel.alerts.isEmpty(),
             "Contiguous sequence 1-2-3 must not trigger any ConflictAlert")
@@ -168,7 +167,7 @@ class StartupReconciliationStepsTest {
         writeActionReceipt("rcpt-022", sequenceNumber = 4)
 
         val channel = CapturingConflictChannel()
-        StartupReconciliation.run(conn, channel)
+        StartupReconciliation.run(shared, channel)
 
         assertEquals(1, channel.alerts.size, "One gap in one session must produce exactly one alert")
         assertEquals("SEQUENCE_GAP_DETECTED", channel.alerts[0].type)
@@ -183,11 +182,11 @@ class StartupReconciliationStepsTest {
         writeActionReceipt("rcpt-031", sequenceNumber = 3)  // gap: missing 2
 
         // Flush the summary gap first (so those don't produce REPAIRED)
-        StartupReconciliation.run(conn)
+        StartupReconciliation.run(shared)
 
         // Second run: no orphaned pending, no summary gaps; only a sequence gap
         val channel = CapturingConflictChannel()
-        val result = StartupReconciliation.run(conn, channel)
+        val result = StartupReconciliation.run(shared, channel)
 
         assertEquals(StartupReconciliation.ReconciliationResult.CLEAN, result,
             "Sequence gap alert must not change CLEAN to any other result")
@@ -206,10 +205,10 @@ class StartupReconciliationStepsTest {
         writeActionReceipt("rcpt-043", agentId = "agent-b", sessionId = "sess-B", sequenceNumber = 3)
 
         // Flush summary gaps from writes above
-        StartupReconciliation.run(conn)
+        StartupReconciliation.run(shared)
 
         val channel = CapturingConflictChannel()
-        StartupReconciliation.run(conn, channel)
+        StartupReconciliation.run(shared, channel)
 
         assertEquals(1, channel.alerts.size,
             "Only the gapped session (B) must produce an alert; clean session (A) must not")

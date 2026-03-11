@@ -1,5 +1,6 @@
 package com.aegisone.inspect
 
+import com.aegisone.db.SharedConnection
 import java.sql.Connection
 
 /**
@@ -9,10 +10,11 @@ import java.sql.Connection
  * The inspector does not validate state — it reports it faithfully, including
  * anomalies, violations, and ghost references.
  *
- * [receiptConn] is required: it provides access to receipts, authority_decisions,
- * system_events, audit_failure_records, and receipt_summaries.
+ * [receiptShared] is required: it provides access to receipts, authority_decisions,
+ * system_events, audit_failure_records, and receipt_summaries. Reads synchronize
+ * on the SharedConnection monitor to avoid corrupting writers sharing the same conn.
  *
- * [reviewConn] is optional: when provided, enables sessions(), currentLocks(),
+ * [reviewShared] is optional: when provided, enables sessions(), currentLocks(),
  * artifacts(), and the cross-table consistency fields in recoverySummary().
  * When null, those methods return empty lists and the summary shows -1 for fields
  * that require the review DB.
@@ -30,9 +32,12 @@ import java.sql.Connection
  * Source: implementationMap-trust-and-audit-v1.md §1–4 (read side)
  */
 class SystemInspector(
-    private val receiptConn: Connection,
-    private val reviewConn: Connection? = null
+    private val receiptShared: SharedConnection,
+    private val reviewShared: SharedConnection? = null
 ) {
+    // Convenience accessors for raw connections (used in private query methods)
+    private val receiptConn: Connection get() = receiptShared.conn
+    private val reviewConn: Connection? get() = reviewShared?.conn
     // -------------------------------------------------------------------------
     // Authority decisions
     // -------------------------------------------------------------------------
@@ -462,12 +467,37 @@ data class RecoverySummary(
     val violationB: Int,             // ghost locks; -1 if reviewConn absent
     val violationC: Int              // expired session locks; -1 if reviewConn absent
 ) {
-    /** True when the system is in a clean, fully consistent state. */
-    val isClean: Boolean
-        get() = unresolvedIrreversible == 0 && orphanedPending == 0 &&
-                violationA <= 0 && violationB <= 0 && violationC <= 0
+    /**
+     * True when the review DB is not connected and cross-table fields are unknown.
+     * An operator MUST NOT treat isClean as authoritative when isDegraded is true.
+     *
+     * Source: adversarialSwarmSynthesis-v1.md G-8 (AOC-1, AOC-8)
+     */
+    val isDegraded: Boolean
+        get() = activeSessions < 0 || violationA < 0 || violationB < 0 || violationC < 0
 
-    /** True when human review is required before the coordinator may go ACTIVE. */
+    /**
+     * True when the system is in a clean, fully consistent state.
+     * Requires all fields to be deterministically known (non-negative) AND zero.
+     * "Couldn't check" (-1) is never rendered as "all clear."
+     *
+     * Source: adversarialSwarmSynthesis-v1.md P3 (AOC-1 fix)
+     */
+    val isClean: Boolean
+        get() = !isDegraded &&
+                unresolvedIrreversible == 0 && orphanedPending == 0 &&
+                violationA == 0 && violationB == 0 && violationC == 0
+
+    /**
+     * True when human review is required before the coordinator may go ACTIVE.
+     * Includes UnauditedIrreversible records, cross-table violations, AND
+     * degraded mode — "couldn't check" is treated as "must review" because
+     * unknown state must never be silently assumed safe.
+     *
+     * Source: adversarialSwarmSynthesis-v1.md P4 (AOC-2 fix, RR-2 hardening)
+     */
     val requiresHumanReview: Boolean
-        get() = unresolvedIrreversible > 0
+        get() = unresolvedIrreversible > 0 ||
+                violationA > 0 || violationB > 0 || violationC > 0 ||
+                isDegraded
 }

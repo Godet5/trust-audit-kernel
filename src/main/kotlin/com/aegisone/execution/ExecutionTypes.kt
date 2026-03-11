@@ -45,14 +45,49 @@ enum class CoordinatorResult {
 }
 
 /**
+ * Declares how a missing receipt after execution should be classified.
+ * This is the executor author's contract — classification is declared per-executor,
+ * not inferred from capability names at reconciliation time.
+ *
+ * ATOMIC        — execution is all-or-nothing by construction; a missing receipt
+ *                 means the action did not escape. Safe to classify as FAILED.
+ * COMPENSATABLE — side effects may occur, but a compensating action exists that
+ *                 can undo them. Coordinator calls outcomeRegistry.compensate();
+ *                 if compensation fails, escalates to UNAUDITED_IRREVERSIBLE.
+ * INDETERMINATE — side effects may have escaped and cannot be compensated.
+ *                 Missing receipt → UNAUDITED_IRREVERSIBLE + conflict alert.
+ *
+ * INDETERMINATE is the safe default: executors that do not declare their crash
+ * semantics are treated as potentially having escaped state.
+ *
+ * Source: receiptDurabilitySpec-v1.md §W2; agentPolicyEngine-v2.1.md §7.6
+ */
+enum class CrashClass {
+    ATOMIC,
+    COMPENSATABLE,
+    INDETERMINATE
+}
+
+/**
  * Executor interface. Called only by the ExecutionCoordinator after PENDING record
  * is durably written. Must not be called directly by any other module.
+ *
+ * [crashClass] declares the crash semantics for this executor. Defaults to
+ * INDETERMINATE — the safe assumption that side effects may have escaped.
+ * Executor authors MUST override [crashClass] when the implementation can
+ * provide stronger guarantees (ATOMIC) or a compensating path (COMPENSATABLE).
  *
  * Source: implementationMap-trust-and-audit-v1.md §3.1
  */
 interface ActionExecutor {
     /** Returns true if execution succeeded. */
     fun execute(request: ActionRequest): Boolean
+
+    /**
+     * Crash semantics for this executor. Defaults to INDETERMINATE.
+     * Override to declare stronger guarantees.
+     */
+    val crashClass: CrashClass get() = CrashClass.INDETERMINATE
 }
 
 /**

@@ -1,5 +1,7 @@
 package com.aegisone.broker
 
+import com.aegisone.boot.SystemEvent
+import com.aegisone.boot.SystemEventChannel
 import com.aegisone.receipt.Receipt
 import com.aegisone.receipt.ReceiptChannel
 import com.aegisone.trust.BootSignal
@@ -28,7 +30,8 @@ class CapabilityBroker(
     private val receiptChannel: ReceiptChannel,
     private val trustedIssuer: TrustInitIdentity,
     private val versionFloorProvider: VersionFloorProvider? = null,
-    private val authorityDecisionChannel: AuthorityDecisionChannel? = null
+    private val authorityDecisionChannel: AuthorityDecisionChannel,
+    private val systemEventChannel: SystemEventChannel? = null
 ) {
     var state: BrokerState = BrokerState.UNINITIALIZED
         private set
@@ -100,8 +103,15 @@ class CapabilityBroker(
      * Attempt to issue a grant. Enforces I-2: no SYSTEM_POLICY grants unless
      * Broker is ACTIVE with a verified, current manifest.
      *
-     * Returns the issued capability on success, null on policy violation.
-     * Every attempt — issued or denied — is recorded to [authorityDecisionChannel] if wired.
+     * P5 fail-closed contract:
+     *   - GrantIssued: decision record must be durably written before capability is returned.
+     *     If the write fails, the grant is blocked — the system did the right thing but
+     *     cannot prove it, so the outcome is withheld.
+     *   - GrantDenied: the denial stands regardless of write outcome. Write failure is
+     *     surfaced as an Anomaly to the receipt channel — the operator must never be left
+     *     with missing authority history for a real outcome.
+     *
+     * Returns the issued capability on success, null on policy violation or write failure.
      */
     fun issueGrant(
         capabilityName: String,
@@ -117,7 +127,7 @@ class CapabilityBroker(
                 violation = "GRANT_BEFORE_INIT",
                 detail = "Grant attempt while Broker is UNINITIALIZED: $capabilityName for $targetRole via $authority"
             ))
-            authorityDecisionChannel?.record(AuthorityDecision.GrantDenied(
+            recordDenial(AuthorityDecision.GrantDenied(
                 capabilityName = capabilityName, targetRole = targetRole, authority = authority,
                 reason = "GRANT_BEFORE_INIT", manifestVersion = null, floorVersion = null
             ))
@@ -129,7 +139,7 @@ class CapabilityBroker(
                 violation = "SYSTEM_POLICY_UNAVAILABLE",
                 detail = "SYSTEM_POLICY grant attempt in $state state: $capabilityName for $targetRole"
             ))
-            authorityDecisionChannel?.record(AuthorityDecision.GrantDenied(
+            recordDenial(AuthorityDecision.GrantDenied(
                 capabilityName = capabilityName, targetRole = targetRole, authority = authority,
                 reason = "SYSTEM_POLICY_UNAVAILABLE",
                 manifestVersion = verifiedManifestVersion, floorVersion = null
@@ -148,12 +158,19 @@ class CapabilityBroker(
                     detail = "Verified manifest version $manifestVersion is below current floor $floor; " +
                              "SYSTEM_POLICY grants suspended"
                 ))
-                authorityDecisionChannel?.record(AuthorityDecision.GrantDenied(
+                recordDenial(AuthorityDecision.GrantDenied(
                     capabilityName = capabilityName, targetRole = targetRole, authority = authority,
                     reason = "MANIFEST_VERSION_BELOW_FLOOR",
                     manifestVersion = verifiedManifestVersion, floorVersion = floor
                 ))
+                val previousState = state
                 state = BrokerState.RESTRICTED
+                systemEventChannel?.emit(SystemEvent.BrokerStateChanged(
+                    fromState = previousState.name,
+                    toState = BrokerState.RESTRICTED.name,
+                    manifestVersion = verifiedManifestVersion,
+                    reason = "MANIFEST_VERSION_BELOW_FLOOR: manifest $manifestVersion < floor $floor"
+                ))
                 return null
             }
         }
@@ -164,7 +181,7 @@ class CapabilityBroker(
                     violation = "ROLE_NOT_IN_MANIFEST",
                     detail = "SYSTEM_POLICY grant for role $targetRole not in manifest agent enumeration"
                 ))
-                authorityDecisionChannel?.record(AuthorityDecision.GrantDenied(
+                recordDenial(AuthorityDecision.GrantDenied(
                     capabilityName = capabilityName, targetRole = targetRole, authority = authority,
                     reason = "ROLE_NOT_IN_MANIFEST",
                     manifestVersion = verifiedManifestVersion, floorVersion = capturedFloor
@@ -182,7 +199,7 @@ class CapabilityBroker(
                     violation = "GRANT_NOT_IN_MANIFEST",
                     detail = "SYSTEM_POLICY grant ($capabilityName, $targetRole) not found in manifest grant list"
                 ))
-                authorityDecisionChannel?.record(AuthorityDecision.GrantDenied(
+                recordDenial(AuthorityDecision.GrantDenied(
                     capabilityName = capabilityName, targetRole = targetRole, authority = authority,
                     reason = "GRANT_NOT_IN_MANIFEST",
                     manifestVersion = verifiedManifestVersion, floorVersion = capturedFloor
@@ -191,17 +208,43 @@ class CapabilityBroker(
             }
         }
 
-        val capability = IssuedCapability(
+        // All checks passed — attempt to record the issued decision durably.
+        // P5: if the record write fails, the grant is blocked. The capability was
+        // correctly authorized but cannot be proven, so we fail closed.
+        val decision = AuthorityDecision.GrantIssued(
+            capabilityName = capabilityName, targetRole = targetRole, authority = authority,
+            manifestVersion = verifiedManifestVersion, floorVersion = capturedFloor
+        )
+        if (!authorityDecisionChannel.record(decision)) {
+            receiptChannel.write(Receipt.PolicyViolation(
+                violation = "AUTHORITY_WRITE_FAILED",
+                detail = "Grant of $capabilityName for $targetRole via $authority was authorized " +
+                         "but decision record write failed; grant blocked (fail-closed)"
+            ))
+            return null
+        }
+
+        return IssuedCapability(
             capabilityName = capabilityName,
             targetRole = targetRole,
             authority = authority,
             manifestVersion = verifiedManifestVersion
         )
-        authorityDecisionChannel?.record(AuthorityDecision.GrantIssued(
-            capabilityName = capabilityName, targetRole = targetRole, authority = authority,
-            manifestVersion = verifiedManifestVersion, floorVersion = capturedFloor
-        ))
-        return capability
+    }
+
+    /**
+     * Record a denial decision. If the write fails, the denial still stands —
+     * but the write failure is surfaced as an Anomaly so the operator knows
+     * there is a gap in the authority decision history.
+     */
+    private fun recordDenial(denial: AuthorityDecision.GrantDenied) {
+        if (!authorityDecisionChannel.record(denial)) {
+            receiptChannel.write(Receipt.Anomaly(
+                type = "DENIAL_RECORD_WRITE_FAILED",
+                detail = "GrantDenied for ${denial.capabilityName} (reason=${denial.reason}) " +
+                         "could not be written to authority_decisions; denial still enforced"
+            ))
+        }
     }
 }
 
