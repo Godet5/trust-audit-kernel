@@ -120,6 +120,7 @@ object StartupReconciliation {
                 reason, detail, inserted_at_ms
             ) VALUES ('Failed', ?, ?, NULL, NULL, NULL, NULL, 'W1_ORPHANED_PENDING', NULL, ?)
         """.trimIndent()
+        conn.autoCommit = false
         conn.prepareStatement(sql).use { ps ->
             for (id in ids) {
                 ps.setString(1, id)
@@ -176,6 +177,7 @@ object StartupReconciliation {
         if (gaps.isEmpty()) return 0
 
         val now = System.currentTimeMillis()
+        conn.autoCommit = false
 
         // Insert regenerated summaries. INSERT OR IGNORE avoids duplicates if another
         // recovery path already wrote the summary since we queried.
