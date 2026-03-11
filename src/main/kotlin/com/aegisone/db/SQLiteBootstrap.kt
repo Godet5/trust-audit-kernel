@@ -121,6 +121,18 @@ object SQLiteBootstrap {
                 """.trimIndent()
             )
 
+            // Uniqueness guard on ActionReceipt.receipt_id.
+            // Non-ActionReceipt subtypes set receipt_id = NULL; the WHERE clause
+            // keeps them out of the index. SQLite treats NULL != NULL for UNIQUE
+            // purposes, so multiple NULL rows are permitted by design.
+            // This index is the DB-level complement to the coordinator's UUIDv4 PRNG:
+            // if a duplicate UUID is written (external tampering or PRNG failure),
+            // the write returns false and the coordinator follows the honest failure path.
+            stmt.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_receipts_action_receipt_id " +
+                "ON receipts(receipt_id) WHERE receipt_id IS NOT NULL"
+            )
+
             // Receipt summary store — RECEIPT_SUMMARY_CHANNEL target.
             // Summaries are derived from full ActionReceipts and are regenerable
             // (W3 crash window). Zone B storage in production (best-effort, not
