@@ -121,6 +121,20 @@ object SQLiteBootstrap {
                 """.trimIndent()
             )
 
+            // Active agent registry — AGENT_REGISTRY target (D-NC3 ceiling enforcement).
+            // One row per active agent. PRIMARY KEY on agent_id enforces uniqueness
+            // at the DB level as a safety net beneath the AgentRegistry synchronized block.
+            // Rows are inserted on registration and deleted on deregistration.
+            stmt.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_agents (
+                    agent_id         TEXT    NOT NULL PRIMARY KEY,
+                    slot             TEXT    NOT NULL,
+                    registered_at_ms INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+
             // Uniqueness guard on ActionReceipt.receipt_id.
             // Non-ActionReceipt subtypes set receipt_id = NULL; the WHERE clause
             // keeps them out of the index. SQLite treats NULL != NULL for UNIQUE

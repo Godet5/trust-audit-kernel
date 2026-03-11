@@ -69,6 +69,32 @@ class SQLiteAuthorityDecisionChannel(private val conn: Connection) : AuthorityDe
                     int(7, decision.floorVersion)
                     str(8, decision.reason)
                 }
+                // Spawn subtypes repurpose grant columns (Phase 0 pragmatics):
+                //   capability_name → agentId
+                //   target_role     → slot name
+                //   authority       → requestingAgentId or "SYSTEM"
+                //   manifest_version, floor_version → NULL (not applicable)
+                //   reason          → DenialReason name (SpawnDenied only)
+                is AuthorityDecision.SpawnIssued -> {
+                    ps.setString(1, "SpawnIssued")
+                    ps.setLong(2, decision.timestamp)
+                    ps.setString(3, decision.agentId)
+                    ps.setString(4, decision.slot.name)
+                    ps.setString(5, decision.requestingAgentId ?: "SYSTEM")
+                    int(6, null)
+                    int(7, null)
+                    str(8, null)
+                }
+                is AuthorityDecision.SpawnDenied -> {
+                    ps.setString(1, "SpawnDenied")
+                    ps.setLong(2, decision.timestamp)
+                    ps.setString(3, decision.agentId)
+                    ps.setString(4, decision.slot.name)
+                    ps.setString(5, decision.requestingAgentId ?: "SYSTEM")
+                    int(6, null)
+                    int(7, null)
+                    str(8, decision.reason)
+                }
             }
             ps.setLong(9, now)
             ps.executeUpdate()
