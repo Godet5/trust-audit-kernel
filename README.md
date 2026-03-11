@@ -339,6 +339,49 @@ Spec anchor: `receiptDurabilitySpec-v1.md §4.5.4–4.5.5`
 
 ---
 
+## External review targets
+
+This is a Phase 0 research harness, not a production system. External critique is
+more useful than praise. If you're reading this looking for something to attack, here
+are the four areas where honest pressure is most valuable:
+
+**1. Crash semantics model** (`receiptDurabilitySpec-v1.md §4.5`, `CrashSemanticsTest`)
+The `CrashClass` enum (ATOMIC / COMPENSATABLE / INDETERMINATE) is new. The live
+execution routing is tested. The startup reconciliation routing is not yet updated to
+use declared crash classes — it still classifies all orphaned PENDING as FAILED (G-2,
+documented gap). The question worth asking: is the three-class model the right
+abstraction, or does real executor behavior reveal a fourth case we haven't named?
+
+**2. Observability honesty** (`ObservabilityE2ETest`, `OperatorInspectorE2ETest`, `SystemInspector`)
+Every decision, grant, receipt, and state transition is supposed to be durable and
+queryable. The `SystemInspector` is read-only and correct under clean conditions. The
+interesting question is degraded mode: does the operator surface tell the truth when
+the review DB is absent, when a session is expired but its lock persists, or when an
+UNAUDITED_IRREVERSIBLE event exists? `RecoveryReviewCoverageTest` and `OperatorInspectorE2ETest`
+OI-8 test this. Review them adversarially.
+
+**3. Multi-process enforcement assumptions** (`MultiProcessCeilingTest`, `SQLiteAgentRegistry`)
+The ceiling (max 2 agents globally) is enforced with `BEGIN IMMEDIATE` + `synchronized`.
+This works against SQLite connections in the same process and across separate processes
+using the same DB file. It does not cover: multiple devices sharing a DB over a network
+filesystem, a process that bypasses SQLite and writes directly to the DB file, or
+Byzantine actors with raw storage access. Those are Phase 0 explicitly-out-of-scope
+assumptions. If you believe one of them is actually in-scope for the threat model,
+`threatModel-v1.1.md` is the place to argue it.
+
+**4. Operator truth under degraded conditions** (`RecoveryReviewCoverageTest`, `StartupRecovery`)
+`RecoverySummary.requiresHumanReview` gates human attention. It fires on
+`UnauditedIrreversible > 0`, cross-table violations, or degraded mode (review DB absent).
+The question: are there reachable states where `requiresHumanReview` is false but a
+human should actually look? The test suite covers the documented violation types. It may
+not cover compound degraded states that weren't anticipated.
+
+Critique against these four areas is more useful than general commentary. The gap ledger
+("Where this can still lie") documents the known limits. Useful external review finds
+limits that aren't in that ledger.
+
+---
+
 ## Invariant discipline
 
 Tests under `src/test/kotlin/com/aegisone/invariants/` are specification-derived
