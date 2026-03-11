@@ -12,6 +12,7 @@ import com.aegisone.review.TokenVerifier
 import com.aegisone.review.VerifiedToken
 import java.sql.Connection
 
+
 /**
  * Runs the full startup recovery sequence before the coordinator goes ACTIVE.
  *
@@ -39,6 +40,13 @@ import java.sql.Connection
  * onSessionExpired() never calls verify(), so this is safe. The internal
  * MemorySteward MUST NOT be exposed to callers or used for write() operations.
  *
+ * Phase 3 — Review cross-table consistency repair (ReviewCrossTableReconciliation):
+ *   Optional. Only runs when [reviewConn] is provided.
+ *   - UNDER_REVIEW artifacts with no lock → reverted to SUBMITTED
+ *   - Locks referencing absent session_ids (ghost locks) → released + artifact reverted
+ *   - EXPIRED/CLOSED sessions with outstanding locks → locks released + artifacts reverted
+ *   All repairs write ProposalStatusReceipts to [receiptChannel].
+ *
  * Traces to: I-3 (receipt reconciliation), I-4 (review state reversion)
  * Source: receiptDurabilitySpec-v1.md §7.1, implementationMap §4.4
  */
@@ -49,7 +57,8 @@ class StartupRecovery(
     private val lockManager: ArtifactLockManager,
     private val receiptChannel: ReceiptChannel,
     private val conflictChannel: ConflictChannel? = null,
-    private val systemEventChannel: SystemEventChannel? = null
+    private val systemEventChannel: SystemEventChannel? = null,
+    private val reviewConn: Connection? = null
 ) {
     fun run(now: Long = System.currentTimeMillis()): StartupRecoveryResult {
         // Phase 1: reconcile receipt/audit state
@@ -65,6 +74,13 @@ class StartupRecovery(
             artifactStore       = artifactStore
         )
         val expiredSessions = ExpiryCoordinator(sessionRegistry, expiryMemorySteward).sweep(now)
+
+        // Phase 3: review cross-table consistency (optional — only when reviewConn is wired).
+        // Handles violations not visible to the session expiry sweep: stranded UNDER_REVIEW
+        // artifacts, ghost locks, and pre-existing EXPIRED sessions with outstanding locks.
+        reviewConn?.let {
+            ReviewCrossTableReconciliation(it, artifactStore, lockManager, receiptChannel).run()
+        }
 
         val result = StartupRecoveryResult(reconciliation, expiredSessions)
         systemEventChannel?.emit(SystemEvent.RecoveryCompleted(
