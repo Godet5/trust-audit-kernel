@@ -339,6 +339,19 @@ Spec anchor: `receiptDurabilitySpec-v1.md §4.5.4–4.5.5`
 
 ---
 
+## Start here if you want to break it
+
+Four entry points, in order of interest:
+
+1. **`CrashSemanticsTest`** — the crash classification model (ATOMIC / COMPENSATABLE / INDETERMINATE) is new. Does real executor behavior reveal a fourth case?
+2. **`StartupReconciliation.kt`** — W2 crash ambiguity is the documented weak spot. The system cannot distinguish "crash before execution" from "crash after execution, before receipt." Both are currently FAILED.
+3. **`SQLiteAgentRegistry`** — concurrency ceiling enforced with `BEGIN IMMEDIATE` + `synchronized`. Where does that break?
+4. **`RecoverySummary.requiresHumanReview`** — a boolean. Is that the right severity model, or does it flatten states that should have distinct operator responses?
+
+If you can break one of those claims, open an issue referencing the invariant or test.
+
+---
+
 ## External review targets
 
 This is a Phase 0 research harness, not a production system. External critique is
