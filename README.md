@@ -382,6 +382,18 @@ limits that aren't in that ledger.
 
 ---
 
+## Automated issue triage
+
+New issues and substantive comments are automatically triaged by a Gemini-based workflow.
+
+The workflow classifies issues against the four external review targets, applies labels, and
+posts a structured triage summary. It does not modify code, open pull requests, or make
+design decisions. Human maintainers decide whether issues require action.
+
+Policy: `AI_TRIAGE_POLICY.md` | Workflow: `.github/workflows/external-review-watch.yml`
+
+---
+
 ## Invariant discipline
 
 Tests under `src/test/kotlin/com/aegisone/invariants/` are specification-derived

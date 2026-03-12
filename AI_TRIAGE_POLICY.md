@@ -1,6 +1,6 @@
-# CLAUDE.md — trust-audit-kernel
+# AI_TRIAGE_POLICY.md — trust-audit-kernel
 
-Project-specific rules for Claude Code and GitHub Actions automation.
+Project rules for automated GitHub Actions triage (Gemini-based) and code review automation.
 
 ## What this repo is
 
