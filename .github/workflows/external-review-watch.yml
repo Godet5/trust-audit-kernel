@@ -18,6 +18,10 @@ concurrency:
 jobs:
   triage:
     runs-on: ubuntu-latest
+    # Skip bot comments and maintainer housekeeping to prevent recursive triage
+    if: |
+      github.actor != 'github-actions[bot]' &&
+      github.actor != 'Godet5'
     timeout-minutes: 15
 
     steps:
